@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import socket
+import statistics
 import threading
 import webbrowser
 import concurrent.futures
@@ -161,19 +162,19 @@ def build_crisis_data():
         try:
             before     = fetch_entsoe_period(zone, CRISIS_BEFORE_START, CRISIS_BEFORE_END)
             after      = fetch_entsoe_period(zone, CRISIS_AFTER_START,  after_end)
-            before_avg = sum(p for _, p in before) / len(before) if before else None
-            after_avg  = sum(p for _, p in after)  / len(after)  if after  else None
+            before_med = statistics.median(p for _, p in before) if before else None
+            after_med  = statistics.median(p for _, p in after)  if after  else None
             error      = None
         except Exception as exc:
             print(f"[CRISIS] {code}: {exc}", flush=True)
-            before_avg = after_avg = None
+            before_med = after_med = None
             error = str(exc)
         return {
             "code":       code,
             "name":       name,
             "group":      group,
-            "before_avg": round(before_avg, 2) if before_avg is not None else None,
-            "after_avg":  round(after_avg,  2) if after_avg  is not None else None,
+            "before_med": round(before_med, 2) if before_med is not None else None,
+            "after_med":  round(after_med,  2) if after_med  is not None else None,
             "error":      error,
         }
 
@@ -216,20 +217,20 @@ def _crisis_html():
         '</div>'
         '<div id="crisis-charts" class="container" style="display:none">'
         '<div class="section-title">Gas-dependent: NL &middot; DE &middot; BE</div>'
-        '<div class="chart-wrap" style="height:155px">'
+        '<div class="chart-wrap" style="height:220px">'
         '<canvas id="chartGas"></canvas>'
         '</div>'
         '<p style="font-size:11px;color:#888;margin:-16px 0 20px 4px">'
-        'Note: &ldquo;Before&rdquo; covers 28&nbsp;days (1&ndash;27&nbsp;Feb); '
+        'Bars show hourly median price. &ldquo;Before&rdquo; covers 28&nbsp;days (1&ndash;27&nbsp;Feb); '
         '&ldquo;After&rdquo; covers fewer days and grows daily.</p>'
         '<div class="section-title" style="margin-top:8px">'
         'Low-carbon: Hydro &amp; Nuclear &mdash; FR &middot; ES &middot; NO South'
         '</div>'
-        '<div class="chart-wrap" style="height:155px">'
+        '<div class="chart-wrap" style="height:220px">'
         '<canvas id="chartLow"></canvas>'
         '</div>'
         '<p style="font-size:11px;color:#888;margin:-16px 0 20px 4px">'
-        'Note: &ldquo;Before&rdquo; covers 28&nbsp;days (1&ndash;27&nbsp;Feb); '
+        'Bars show hourly median price. &ldquo;Before&rdquo; covers 28&nbsp;days (1&ndash;27&nbsp;Feb); '
         '&ldquo;After&rdquo; covers fewer days and grows daily.</p>'
         '<div class="section-title" style="margin-top:8px">'
         'Netherlands &mdash; daily average day-ahead price (1 Feb &rarr; yesterday)'
@@ -275,7 +276,9 @@ const pctBadgePlugin = {
       if (before[i] == null || after[i] == null) return;
       const pct  = ((after[i] - before[i]) / Math.abs(before[i])) * 100;
       const sign = pct >= 0 ? '+' : '';
-      const text = sign + pct.toFixed(1) + '%';
+      const text = Math.abs(pct) > 200
+        ? (pct >= 0 ? '>' : '<-') + '200%'
+        : sign + pct.toFixed(1) + '%';
       const fg   = pct >= 0 ? '#dc3545' : '#198754';
       const bg   = pct >= 0 ? 'rgba(220,53,69,0.12)' : 'rgba(25,135,84,0.12)';
       const x = bar.x + 4, y = bar.y;
@@ -333,16 +336,16 @@ function makeGroupChart(canvasId, countries, afterColors) {
       labels: countries.map(c => c.name + (c.error ? ' \u26a0' : '')),
       datasets: [
         {
-          label: 'Before  1\u201327 Feb',
-          data: countries.map(c => c.before_avg),
+          label: 'Before  1\u201327 Feb  (median)',
+          data: countries.map(c => c.before_med),
           backgroundColor: 'rgba(120,120,120,0.28)',
           borderColor:     'rgba(120,120,120,0.55)',
           borderWidth: 1,
           barThickness: 26,
         },
         {
-          label: 'After  2 Mar\u2013yesterday',
-          data: countries.map(c => c.after_avg),
+          label: 'After  2 Mar\u2013yesterday  (median)',
+          data: countries.map(c => c.after_med),
           backgroundColor: afterColors.map(c => c + '44'),
           borderColor:     afterColors,
           borderWidth: 1.5,
@@ -383,7 +386,7 @@ function makeGroupChart(canvasId, countries, afterColors) {
       },
       scales: {
         x: {
-          min: 50,
+          beginAtZero: true,
           title: { display: true, text: '\u20ac/MWh', font: { size: 11 } },
           ticks: { font: { size: 11 } },
           grid:  { color: 'rgba(0,0,0,0.05)' }
