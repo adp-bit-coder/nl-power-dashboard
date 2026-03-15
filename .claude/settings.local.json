@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl \"https://www.tennet.org/xml/settlementprices/SettlementPrices.xml?fromDate=2026-03-04&toDate=2026-03-05&product=Onbalans&format=csv\")",
+      "Bash(pip install requests python-dotenv -q)",
+      "Bash(python fetch_tennet.py)",
+      "WebFetch(domain:developer.tennet.eu)",
+      "Bash(python power_data.py)",
+      "Bash(python skills/power/power_data.py)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(pip install flask -q)",
+      "Bash(python skills/power/server.py)",
+      "Bash(python -c \":*)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :5050)",
+      "Bash(taskkill /PID 34780 /F)",
+      "Bash(cmd /c \"taskkill /PID 34780 /F\")",
+      "Bash(cmd /c \"netstat -ano | findstr :5050\")",
+      "Bash(cmd /c \"netstat -ano | findstr 5050\")",
+      "Bash(cmd /c \"netstat -aon | findstr :5050\")",
+      "Bash(while read:*)",
+      "Bash(do taskkill:*)",
+      "Bash(done)",
+      "Bash(curl -s http://127.0.0.1:5050)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

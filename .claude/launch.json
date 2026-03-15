@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "power-data",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["skills/power/server.py"],
+      "autoPort": true
+    }
+  ]
+}
