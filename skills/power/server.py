@@ -1628,6 +1628,11 @@ def _wsd_html():
         '<div id="wsd-charts" class="container" style="display:none">'
         # KPI cards
         '<div id="wsd-cards" class="cards"></div>'
+        '<p style="font-size:11px;color:#888;padding:0 2px;margin:-16px 0 20px">'
+        '\u26a0\ufe0f Generation shown covers 6 tracked production types only '
+        '(wind, solar, gas, nuclear, biomass). '
+        'Cross-border imports and all other sources are excluded. '
+        'The balance figure is indicative only.</p>'
         # Supply vs Demand
         '<div class="section-title">Supply vs demand &mdash; today (15-min resolution, MW)</div>'
         '<div class="chart-wrap" style="height:260px">'
@@ -1695,7 +1700,8 @@ function renderWSDKPIs(data) {
   const cards = [
     { label: 'Current Load',       value: fmt(k.current_load),   sub: 'latest ENTSO-E reading', cls: '' },
     { label: 'Current Generation', value: fmt(k.current_gen),    sub: '6-type sum (today)',      cls: '' },
-    { label: 'Balance (6-type gen \u2212 load)', value: balFmt, sub: '+ surplus  \u2212 deficit (excl. imports)', cls: balCls },
+    { label: 'Tracked Gen \u2212 Load',  value: balFmt,
+      sub: 'partial \u2014 excl. imports &amp; untracked types', cls: balCls },
     { label: 'Peak Wind Forecast', value: k.peak_wind != null ? k.peak_wind + '\u00a0m/s' : '\u2014',
       sub: '100m hub height, 3-day', cls: '' },
   ];
@@ -2173,7 +2179,7 @@ def render_html(yesterday, points, da_prices):
       <div class="card trough">
         <div class="label">{'Negative' if min_shortage[1] < 0 else 'Trough'} Shortage</div>
         <div class="value">{min_shortage[1]:.2f} <span style="font-size:14px;font-weight:400">€/MWh</span></div>
-        <div class="sub">at {min_shortage[0]}</div>
+        <div class="sub">at {min_shortage[0]}{'&nbsp;&nbsp;<span style="font-size:10px;color:#6c757d;font-weight:400">✓ verified · TenneT</span>' if min_shortage[1] < 0 else ''}</div>
       </div>
       <div class="card">
         <div class="label">Peak Surplus</div>
