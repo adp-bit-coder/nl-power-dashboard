@@ -18,6 +18,7 @@ load_dotenv()
 
 tennet_key = os.getenv("TENNET_API_KEY")
 entsoe_key = os.getenv("ENTSOE_API_KEY")
+agsi_key   = os.getenv("AGSI_API_KEY")
 
 REG_LABELS = {1: "UP", -1: "DOWN", 0: "STABLE", 2: "UP+DOWN"}
 REG_COLORS = {1: "#d4edda", -1: "#d1ecf1", 0: "#f8f9fa", 2: "#fff3cd"}
@@ -39,6 +40,32 @@ CRISIS_BEFORE_START = "202601312300"  # 1 Feb 2026 00:00 CET
 CRISIS_BEFORE_END   = "202602272300"  # 28 Feb 2026 00:00 CET (exclusive)
 CRISIS_AFTER_START  = "202603012300"  # 2 Mar 2026 00:00 CET
 CRISIS_NL_START     = "202601312300"  # same as before-start for NL trajectory
+
+NL_ZONE              = "10YNL----------L"
+ENTSOE_HISTORY_START = "202601312300"   # 1 Feb 2026 00:00 CET
+
+# ENTSO-E generation type definitions (code, display label, chart colour)
+PSR_TYPES = [
+    ("B04", "Fossil Gas",          "#FF6B6B"),
+    ("B02", "Coal/Lignite",        "#8B7355"),
+    ("B05", "Coal-derived Gas",    "#CC8844"),
+    ("B06", "Fossil Oil",          "#AA6644"),
+    ("B14", "Nuclear",             "#9B59B6"),
+    ("B10", "Hydro Pumped",        "#5DADE2"),
+    ("B01", "Biomass",             "#A3C97A"),
+    ("B09", "Geothermal",          "#48C9B0"),
+    ("B11", "Hydro Run-of-river",  "#1ABC9C"),
+    ("B19", "Wind Onshore",        "#4FC3F7"),
+    ("B18", "Wind Offshore",       "#1E90FF"),
+    ("B16", "Solar",               "#FFD700"),
+]
+RENEWABLE_CODES = {"B01", "B09", "B11", "B16", "B18", "B19"}
+FOSSIL_CODES    = {"B02", "B04", "B05", "B06"}
+
+# Module-level caches (keyed by date string so they refresh daily)
+_gas_cache        = {"data": None, "date": None}
+_renewables_cache = {"data": None, "date": None}
+_heatmap_cache    = {"data": None, "date": None}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -199,6 +226,287 @@ def build_crisis_data():
     return {"countries": countries, "nl_trajectory": nl_traj, "yesterday": str(yesterday)}
 
 
+# ── Gas Storage (AGSI+) ───────────────────────────────────────────────────────
+
+def build_gas_storage_data():
+    headers = {"x-key": agsi_key, "Accept": "application/json"}
+    resp = requests.get("https://agsi.gie.eu/api",
+                        params={"country": "NL", "size": 365},
+                        headers=headers, timeout=20)
+    resp.raise_for_status()
+    raw = resp.json()
+    nl_data = raw.get("data", []) if isinstance(raw, dict) else raw
+    if not nl_data:
+        raise RuntimeError("No NL gas storage data returned from AGSI+")
+
+    # Sort ascending by date (gasDayStart field)
+    nl_data = sorted(nl_data, key=lambda x: x.get("gasDayStart", ""))
+    latest  = nl_data[-1]
+
+    current_full   = safe_float(latest.get("full"))         or 0.0   # %
+    current_volume = safe_float(latest.get("gasInStorage")) or 0.0   # TWh (current stored volume)
+    injection  = safe_float(latest.get("injection"))        or 0.0   # GWh/day
+    withdrawal = safe_float(latest.get("withdrawal"))       or 0.0   # GWh/day
+    daily_change = injection - withdrawal                              # + = net inject
+
+    # days-until-empty: last 7 days average net withdrawal
+    recent = nl_data[-7:]
+    net_wds = [max(0.0, (safe_float(d.get("withdrawal")) or 0) - (safe_float(d.get("injection")) or 0))
+               for d in recent]
+    net_wds = [v for v in net_wds if v > 0]
+    days_until_empty = None
+    if net_wds:
+        avg_nw = sum(net_wds) / len(net_wds)   # GWh/day
+        if avg_nw > 0:
+            days_until_empty = int(round(current_volume * 1000 / avg_nw))
+
+    # EU average filling level (optional)
+    eu_avg_full = None
+    try:
+        r2 = requests.get("https://agsi.gie.eu/api",
+                          params={"country": "EU", "size": 1},
+                          headers=headers, timeout=12)
+        if r2.ok:
+            eu_raw  = r2.json()
+            eu_data = eu_raw.get("data", []) if isinstance(eu_raw, dict) else eu_raw
+            if eu_data:
+                eu_avg_full = round(safe_float(eu_data[0].get("full")) or 0, 2)
+    except Exception:
+        pass
+
+    timeline = []
+    for d in nl_data:
+        try:
+            timeline.append({"date": d["gasDayStart"],
+                              "full": round(safe_float(d.get("full")) or 0, 2)})
+        except (KeyError, TypeError):
+            pass
+
+    return {
+        "current_full":     round(current_full,   2),
+        "current_volume":   round(current_volume, 2),
+        "daily_change_gwh": round(daily_change,   1),
+        "days_until_empty": days_until_empty,
+        "eu_avg_full":      eu_avg_full,
+        "timeline":         timeline,
+        "as_of":            latest.get("gasDayStart", ""),
+    }
+
+
+# ── Renewables NL (ENTSO-E A75) ───────────────────────────────────────────────
+
+def parse_entsoe_generation(xml_text):
+    """Parse ENTSO-E A75 XML → {psrType: [(utc_dt, mw), ...]}
+    Uses {*} namespace wildcard so it works with the GL_MarketDocument
+    namespace (generationloaddocument:3:0), which differs from A44's namespace."""
+    root   = ET.fromstring(xml_text)
+    result = {}
+    for ts in root.findall(".//{*}TimeSeries"):
+        psr_el = ts.find(".//{*}psrType")
+        if psr_el is None:
+            continue
+        psr = psr_el.text
+        for period in ts.findall("{*}Period"):
+            start_el = period.find(".//{*}start")
+            res_el   = period.find("{*}resolution")
+            if start_el is None or res_el is None:
+                continue
+            start_dt = datetime.fromisoformat(start_el.text.replace("Z", "+00:00"))
+            delta    = timedelta(hours=1) if res_el.text == "PT60M" else timedelta(minutes=15)
+            for pt in period.findall("{*}Point"):
+                pos_el = pt.find("{*}position")
+                qty_el = pt.find("{*}quantity")
+                if pos_el is None or qty_el is None:
+                    continue
+                result.setdefault(psr, []).append(
+                    (start_dt + (int(pos_el.text) - 1) * delta, float(qty_el.text)))
+    return result
+
+
+def _fetch_gen_type(args):
+    code, start, end = args
+    params = {
+        "securityToken": entsoe_key,
+        "documentType":  "A75",
+        "processType":   "A16",
+        "in_Domain":     NL_ZONE,
+        "periodStart":   start,
+        "periodEnd":     end,
+        "psrType":       code,
+    }
+    try:
+        resp = requests.get("https://web-api.tp.entsoe.eu/api", params=params, timeout=30)
+        if not resp.ok:
+            return code, []
+        return code, parse_entsoe_generation(resp.text).get(code, [])
+    except Exception:
+        return code, []
+
+
+def build_renewables_data():
+    yesterday = date.today() - timedelta(days=1)
+    after_end = yesterday.strftime("%Y%m%d") + "2300"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_fetch_gen_type,
+                              [(code, ENTSOE_HISTORY_START, after_end)
+                               for code, _, _ in PSR_TYPES]))
+    raw = dict(results)
+
+    # Daily MW averages per source
+    daily_by_code = {}
+    for code, pts in raw.items():
+        if not pts:
+            continue
+        by_date = {}
+        for dt, mw in pts:
+            d = dt.astimezone(CET).date()
+            by_date.setdefault(d, []).append(mw)
+        daily_by_code[code] = {str(d): round(sum(vs)/len(vs), 1)
+                                for d, vs in sorted(by_date.items())}
+
+    all_dates = sorted({d for dd in daily_by_code.values() for d in dd.keys()})
+
+    # Build datasets in PSR_TYPES order (bottom→top of stacked area)
+    datasets = []
+    for code, name, color in PSR_TYPES:
+        if code not in daily_by_code:
+            continue
+        data = [daily_by_code[code].get(d) for d in all_dates]
+        if all(v is None or v == 0 for v in data):
+            continue
+        datasets.append({"code": code, "label": name, "color": color, "data": data})
+
+    # KPIs
+    latest_date = all_dates[-1] if all_dates else None
+    ren_share   = None
+    if latest_date:
+        ren = sum((daily_by_code.get(c, {}).get(latest_date) or 0) for c in RENEWABLE_CODES)
+        tot = sum((daily_by_code.get(c, {}).get(latest_date) or 0) for c, _, _ in PSR_TYPES)
+        ren_share = round(ren / tot * 100, 1) if tot > 0 else None
+
+    peak_solar = None
+    if "B16" in daily_by_code and daily_by_code["B16"]:
+        bd = max(daily_by_code["B16"].items(), key=lambda x: x[1])
+        peak_solar = {"date": bd[0], "mw": bd[1]}
+
+    peak_wind = None
+    wind_combined = {}
+    for code in ("B18", "B19"):
+        for d, v in daily_by_code.get(code, {}).items():
+            wind_combined[d] = wind_combined.get(d, 0) + v
+    if wind_combined:
+        bd = max(wind_combined.items(), key=lambda x: x[1])
+        peak_wind = {"date": bd[0], "mw": round(bd[1], 1)}
+
+    # Interpretation text
+    event_date   = "2026-02-28"
+    before_dates = [d for d in all_dates if d <= event_date]
+    after_dates  = [d for d in all_dates if d >  event_date]
+
+    def avg_share(dates, codes):
+        shares = []
+        for d in dates:
+            num = sum((daily_by_code.get(c, {}).get(d) or 0) for c in codes)
+            tot = sum((daily_by_code.get(c, {}).get(d) or 0) for c, _, _ in PSR_TYPES)
+            if tot > 0:
+                shares.append(num / tot * 100)
+        return round(sum(shares)/len(shares), 1) if shares else None
+
+    br, ar = avg_share(before_dates, RENEWABLE_CODES), avg_share(after_dates, RENEWABLE_CODES)
+    bf, af = avg_share(before_dates, FOSSIL_CODES),    avg_share(after_dates, FOSSIL_CODES)
+
+    interp = ""
+    if br is not None and ar is not None:
+        d1 = "rose" if ar > br else "fell"
+        interp += f"Average renewables share {d1} from {br}% (1\u201327\u00a0Feb) to {ar}% after 28\u00a0Feb. "
+    if bf is not None and af is not None:
+        d2 = "increased" if af > bf else "decreased"
+        interp += f"Fossil fuel share {d2} from {bf}% to {af}% post-event."
+
+    return {
+        "dates":          all_dates,
+        "datasets":       datasets,
+        "ren_share":      ren_share,
+        "peak_solar":     peak_solar,
+        "peak_wind":      peak_wind,
+        "interpretation": interp,
+        "as_of":          str(yesterday),
+    }
+
+
+# ── Price Heatmap ─────────────────────────────────────────────────────────────
+
+def build_heatmap_data():
+    yesterday = date.today() - timedelta(days=1)
+    after_end = yesterday.strftime("%Y%m%d") + "2300"
+    params = {
+        "securityToken": entsoe_key,
+        "documentType":  "A44",
+        "in_Domain":     NL_ZONE,
+        "out_Domain":    NL_ZONE,
+        "periodStart":   ENTSOE_HISTORY_START,
+        "periodEnd":     after_end,
+    }
+    resp = requests.get("https://web-api.tp.entsoe.eu/api", params=params, timeout=30)
+    resp.raise_for_status()
+    prices = parse_entsoe_prices(resp.text)
+    if not prices:
+        raise RuntimeError("No price data returned for heatmap")
+
+    grid_data = {}
+    for dt, price in prices:
+        cet  = dt.astimezone(CET)
+        dstr = cet.strftime("%Y-%m-%d")
+        grid_data.setdefault(dstr, {})[cet.hour] = price
+
+    all_dates = sorted(grid_data.keys())
+    grid = [[grid_data[d].get(h) for h in range(24)] for d in all_dates]
+
+    flat      = [p for row in grid for p in row if p is not None]
+    price_min = min(flat) if flat else 0
+    price_max = max(flat) if flat else 100
+
+    hour_avgs = []
+    for h in range(24):
+        vals = [grid[i][h] for i in range(len(all_dates)) if grid[i][h] is not None]
+        hour_avgs.append(round(sum(vals)/len(vals), 2) if vals else None)
+
+    valid_avgs     = [v for v in hour_avgs if v is not None]
+    cheapest_hour  = hour_avgs.index(min(valid_avgs)) if valid_avgs else 0
+    expensive_hour = hour_avgs.index(max(valid_avgs)) if valid_avgs else 23
+
+    day_avgs       = [(d, round(sum(p for p in grid[i] if p is not None) /
+                                max(1, sum(1 for p in grid[i] if p is not None)), 2))
+                      for i, d in enumerate(all_dates)]
+    biggest_day    = max(day_avgs, key=lambda x: x[1]) if day_avgs else None
+
+    event_date    = "2026-02-28"
+    before_flat   = [p for i, d in enumerate(all_dates) if d <= event_date
+                     for p in grid[i] if p is not None]
+    after_flat    = [p for i, d in enumerate(all_dates) if d >  event_date
+                     for p in grid[i] if p is not None]
+    pre_avg  = round(sum(before_flat)/len(before_flat), 2) if before_flat else None
+    post_avg = round(sum(after_flat) /len(after_flat),  2) if after_flat  else None
+    pct_change = (round((post_avg - pre_avg) / abs(pre_avg) * 100, 1)
+                  if pre_avg and post_avg and pre_avg != 0 else None)
+
+    return {
+        "dates":          all_dates,
+        "grid":           grid,
+        "price_min":      round(price_min, 2),
+        "price_max":      round(price_max, 2),
+        "hour_avgs":      hour_avgs,
+        "cheapest_hour":  cheapest_hour,
+        "expensive_hour": expensive_hour,
+        "biggest_day":    biggest_day,
+        "pre_avg":        pre_avg,
+        "post_avg":       post_avg,
+        "pct_change":     pct_change,
+        "as_of":          str(yesterday),
+    }
+
+
 # ── crisis HTML/JS templates (plain strings — no f-string escaping needed) ───
 
 def _crisis_html():
@@ -248,6 +556,7 @@ def _crisis_html():
 
 def _crisis_js():
     # Plain string: no {{ }} escaping needed
+    # Note: pctBadgePlugin, eventLinesPlugin, rollingAvg defined in _shared_js()
     return """<script>
 let crisisRequested = false;
 
@@ -266,68 +575,6 @@ function loadCrisisData() {
         '<p style="color:#dc3545;margin-top:40px;font-size:13px">Failed to load: ' + err + '</p>';
     });
 }
-
-// Plugin: % change badges drawn inline at right end of the "after" bar
-const pctBadgePlugin = {
-  id: 'pctBadge',
-  afterDatasetsDraw(chart, _args, opts) {
-    if (!opts || !opts.enabled) return;
-    const {ctx, data} = chart;
-    const before = data.datasets[0].data;
-    const after  = data.datasets[1].data;
-    chart.getDatasetMeta(1).data.forEach((bar, i) => {
-      if (before[i] == null || after[i] == null) return;
-      const pct  = ((after[i] - before[i]) / Math.abs(before[i])) * 100;
-      const sign = pct >= 0 ? '+' : '';
-      const text = Math.abs(pct) > 200
-        ? (pct >= 0 ? '>' : '<-') + '200%'
-        : sign + pct.toFixed(1) + '%';
-      const fg   = pct >= 0 ? '#dc3545' : '#198754';
-      const bg   = pct >= 0 ? 'rgba(220,53,69,0.12)' : 'rgba(25,135,84,0.12)';
-      const x = bar.x + 4, y = bar.y;
-      ctx.save();
-      ctx.font = 'bold 11px system-ui';
-      const tw = ctx.measureText(text).width;
-      ctx.fillStyle = bg;
-      ctx.fillRect(x, y - 9, tw + 10, 18);
-      ctx.fillStyle = fg;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(text, x + 5, y);
-      ctx.restore();
-    });
-  }
-};
-
-// Plugin: vertical dashed event lines on the NL trajectory
-// Pass { below: true } on a line to draw label below the top instead of above
-const eventLinesPlugin = {
-  id: 'eventLines',
-  afterDatasetsDraw(chart, _args, opts) {
-    if (!opts || !opts.lines) return;
-    const {ctx, scales, chartArea} = chart;
-    opts.lines.forEach(({idx, color, label, below}) => {
-      if (idx === -1) return;
-      const x = scales.x.getPixelForValue(idx);
-      if (x < chartArea.left || x > chartArea.right) return;
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth   = 1.5;
-      ctx.setLineDash([5, 4]);
-      ctx.beginPath();
-      ctx.moveTo(x, chartArea.top);
-      ctx.lineTo(x, chartArea.bottom);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle  = color;
-      ctx.font       = 'bold 10px system-ui';
-      ctx.textAlign  = 'center';
-      const labelY   = below ? chartArea.top + 16 : chartArea.top - 7;
-      ctx.fillText(label, x, labelY);
-      ctx.restore();
-    });
-  }
-};
 
 function makeGroupChart(canvasId, countries, afterColors) {
   const ch = Chart.getChart(canvasId);
@@ -502,6 +749,599 @@ function renderCrisisCharts(data) {
 </script>"""
 
 
+# ── Shared JS plugins (used by multiple tabs) ─────────────────────────────────
+
+def _shared_js():
+    return """<script>
+// ── Shared Chart.js plugins & utilities ──────────────────────────────────────
+
+const pctBadgePlugin = {
+  id: 'pctBadge',
+  afterDatasetsDraw(chart, _args, opts) {
+    if (!opts || !opts.enabled) return;
+    const {ctx, data} = chart;
+    const before = data.datasets[0].data;
+    const after  = data.datasets[1].data;
+    chart.getDatasetMeta(1).data.forEach((bar, i) => {
+      if (before[i] == null || after[i] == null) return;
+      const pct  = ((after[i] - before[i]) / Math.abs(before[i])) * 100;
+      const sign = pct >= 0 ? '+' : '';
+      const text = Math.abs(pct) > 200
+        ? (pct >= 0 ? '>' : '<-') + '200%'
+        : sign + pct.toFixed(1) + '%';
+      const fg = pct >= 0 ? '#dc3545' : '#198754';
+      const bg = pct >= 0 ? 'rgba(220,53,69,0.12)' : 'rgba(25,135,84,0.12)';
+      const x = bar.x + 4, y = bar.y;
+      ctx.save();
+      ctx.font = 'bold 11px system-ui';
+      const tw = ctx.measureText(text).width;
+      ctx.fillStyle = bg;
+      ctx.fillRect(x, y - 9, tw + 10, 18);
+      ctx.fillStyle = fg;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, x + 5, y);
+      ctx.restore();
+    });
+  }
+};
+
+const eventLinesPlugin = {
+  id: 'eventLines',
+  afterDatasetsDraw(chart, _args, opts) {
+    if (!opts || !opts.lines) return;
+    const {ctx, scales, chartArea} = chart;
+    opts.lines.forEach(({idx, color, label, below}) => {
+      if (idx === -1) return;
+      const x = scales.x.getPixelForValue(idx);
+      if (x < chartArea.left || x > chartArea.right) return;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = 1.5;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(x, chartArea.top);
+      ctx.lineTo(x, chartArea.bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color;
+      ctx.font = 'bold 10px system-ui';
+      ctx.textAlign = 'center';
+      const labelY = below ? chartArea.top + 16 : chartArea.top - 7;
+      ctx.fillText(label, x, labelY);
+      ctx.restore();
+    });
+  }
+};
+
+function rollingAvg(arr, win) {
+  return arr.map((_, i) => {
+    const slice = arr.slice(Math.max(0, i - win + 1), i + 1).filter(v => v != null);
+    return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : null;
+  });
+}
+</script>"""
+
+
+# ── Gas Storage HTML/JS ───────────────────────────────────────────────────────
+
+def _gas_storage_html():
+    return (
+        '<div id="gas-storage" class="tab-panel">'
+        '<div class="crisis-context">'
+        '<p>Dutch underground natural gas storage filling levels over the past 12 months. '
+        'The dashed line marks the current EU&nbsp;average for context. '
+        'Vertical lines mark Operation Epic Fury (28&nbsp;Feb&nbsp;2026) '
+        'and the Strait of Hormuz closure (2&nbsp;Mar&nbsp;2026). '
+        'Source: GIE AGSI+ Transparency Platform.</p>'
+        '</div>'
+        '<div id="gs-loading" style="text-align:center;padding:80px 24px;color:#888">'
+        '<div class="spinner"></div>'
+        '<p style="margin-top:12px;font-size:13px">Fetching AGSI+ storage data&hellip;</p>'
+        '</div>'
+        '<div id="gs-charts" class="container" style="display:none">'
+        '<div id="gs-cards" class="cards"></div>'
+        '<div class="section-title">NL gas storage filling level — last 365 days</div>'
+        '<div class="chart-wrap" style="height:300px">'
+        '<canvas id="chartGasStorage"></canvas>'
+        '</div>'
+        '<p style="font-size:11px;color:#888;margin:-16px 0 20px 4px">'
+        'Source: GIE AGSI+ Transparency Platform. Updated daily at 19:30&nbsp;CET.</p>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _gas_storage_js():
+    return """<script>
+let gsRequested = false;
+
+function loadGasStorageData() {
+  if (gsRequested) return;
+  gsRequested = true;
+  fetch('/api/gas-storage')
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      document.getElementById('gs-loading').style.display = 'none';
+      document.getElementById('gs-charts').style.display  = 'block';
+      renderGasStorageKPIs(data);
+      renderGasStorageChart(data);
+    })
+    .catch(err => {
+      document.getElementById('gs-loading').innerHTML =
+        '<p style="color:#dc3545;margin-top:40px;font-size:13px">Failed to load: ' + err + '</p>';
+    });
+}
+
+function renderGasStorageKPIs(data) {
+  const sign  = data.daily_change_gwh >= 0 ? '+' : '';
+  const chgLbl = data.daily_change_gwh >= 0 ? 'net injection' : 'net withdrawal';
+  const cards = [
+    { label: 'Filling Level',     value: data.current_full.toFixed(1) + '%',
+      sub: 'as of ' + data.as_of, cls: '' },
+    { label: 'Volume in Storage', value: data.current_volume.toFixed(1) + ' TWh',
+      sub: 'working gas', cls: '' },
+    { label: 'Daily Change',
+      value: sign + data.daily_change_gwh.toFixed(0) + ' GWh/d',
+      sub: chgLbl,
+      cls: data.daily_change_gwh >= 0 ? '' : 'peak' },
+    { label: 'Days Until Empty',
+      value: data.days_until_empty ? data.days_until_empty + ' days' : '\u2014',
+      sub: '7-day avg withdrawal rate', cls: '' },
+  ];
+  document.getElementById('gs-cards').innerHTML = cards.map(c =>
+    '<div class="card ' + c.cls + '">' +
+    '<div class="label">' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+}
+
+function renderGasStorageChart(data) {
+  const labels  = data.timeline.map(d => d.date);
+  const fillPct = data.timeline.map(d => d.full);
+  const epfIdx  = labels.indexOf('2026-02-28');
+  const hormIdx = labels.indexOf('2026-03-02');
+
+  const datasets = [{
+    label: 'NL filling level (%)',
+    data: fillPct,
+    borderColor: '#2196F3',
+    backgroundColor: 'rgba(33,150,243,0.1)',
+    borderWidth: 2,
+    pointRadius: 0,
+    fill: true,
+    tension: 0.3,
+    spanGaps: true,
+  }];
+
+  if (data.eu_avg_full !== null && data.eu_avg_full !== undefined) {
+    datasets.push({
+      label: 'EU average (' + data.eu_avg_full.toFixed(1) + '%)',
+      data: Array(labels.length).fill(data.eu_avg_full),
+      borderColor: '#888',
+      borderDash: [6, 4],
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: false,
+      spanGaps: true,
+    });
+  }
+
+  const ch = Chart.getChart('chartGasStorage');
+  if (ch) ch.destroy();
+  new Chart(document.getElementById('chartGasStorage'), {
+    type: 'line',
+    plugins: [eventLinesPlugin],
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 28 } },
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 11 } } },
+        eventLines: {
+          lines: [
+            { idx: epfIdx,  color: '#dc3545', label: 'Op. Epic Fury' },
+            { idx: hormIdx, color: '#fd7e14', label: 'Hormuz closed', below: true },
+          ]
+        },
+        tooltip: {
+          callbacks: {
+            title: items => {
+              const d = new Date(items[0].label + 'T12:00:00');
+              return d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
+            },
+            label: c => ' ' + c.dataset.label + ': ' + c.parsed.y.toFixed(1) + '%'
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            maxTicksLimit: 20, font: { size: 10 }, maxRotation: 45,
+            callback(val) {
+              const d = new Date(labels[val] + 'T12:00:00');
+              return d.toLocaleDateString('en-GB', {day:'numeric', month:'short'});
+            }
+          },
+          grid: { color: 'rgba(0,0,0,0.05)' }
+        },
+        y: {
+          min: 0, max: 100,
+          title: { display: true, text: '% full', font: { size: 11 } },
+          ticks: { font: { size: 11 }, callback: v => v + '%' },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        }
+      }
+    }
+  });
+}
+</script>"""
+
+
+# ── Renewables NL HTML/JS ─────────────────────────────────────────────────────
+
+def _renewables_html():
+    return (
+        '<div id="renewables-nl" class="tab-panel">'
+        '<div class="crisis-context">'
+        '<p>Netherlands actual electricity generation by source (ENTSO&#8209;E A75), '
+        '1&nbsp;Feb&nbsp;2026 to yesterday. Stacked area = total generation mix. '
+        'Vertical lines mark Operation Epic Fury and Hormuz closure.</p>'
+        '</div>'
+        '<div id="ren-loading" style="text-align:center;padding:80px 24px;color:#888">'
+        '<div class="spinner"></div>'
+        '<p style="margin-top:12px;font-size:13px">'
+        'Fetching ENTSO&#8209;E generation data for 12 source types&hellip;</p>'
+        '</div>'
+        '<div id="ren-charts" class="container" style="display:none">'
+        '<div id="ren-cards" class="cards"></div>'
+        '<div class="section-title">NL generation mix — daily average (MW)</div>'
+        '<div class="chart-wrap" style="height:380px">'
+        '<canvas id="chartRenewables"></canvas>'
+        '</div>'
+        '<div id="ren-interpretation" style="background:#1a1a3a;border-left:3px solid #4f8ef7;'
+        'color:#aaa;font-size:12px;line-height:1.7;padding:12px 20px;margin-bottom:24px;'
+        'border-radius:0 6px 6px 0"></div>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _renewables_js():
+    return """<script>
+let renRequested = false;
+
+function loadRenewablesData() {
+  if (renRequested) return;
+  renRequested = true;
+  fetch('/api/renewables')
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      document.getElementById('ren-loading').style.display = 'none';
+      document.getElementById('ren-charts').style.display  = 'block';
+      renderRenewablesKPIs(data);
+      renderRenewablesChart(data);
+      if (data.interpretation) {
+        document.getElementById('ren-interpretation').textContent = data.interpretation;
+      }
+    })
+    .catch(err => {
+      document.getElementById('ren-loading').innerHTML =
+        '<p style="color:#dc3545;margin-top:40px;font-size:13px">Failed to load: ' + err + '</p>';
+    });
+}
+
+function renderRenewablesKPIs(data) {
+  function fmtDate(ds) {
+    const d = new Date(ds + 'T12:00:00');
+    return d.toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric'});
+  }
+  const cards = [
+    { label: 'Renewables Share (latest day)',
+      value: data.ren_share !== null ? data.ren_share + '%' : '\u2014',
+      sub: 'wind + solar + hydro + biomass', cls: '' },
+    { label: 'Peak Solar Day',
+      value: data.peak_solar ? data.peak_solar.mw.toFixed(0) + ' MW avg' : '\u2014',
+      sub: data.peak_solar ? fmtDate(data.peak_solar.date) : '', cls: '' },
+    { label: 'Peak Wind Day (on+offshore)',
+      value: data.peak_wind ? data.peak_wind.mw.toFixed(0) + ' MW avg' : '\u2014',
+      sub: data.peak_wind ? fmtDate(data.peak_wind.date) : '', cls: '' },
+  ];
+  document.getElementById('ren-cards').innerHTML = cards.map(c =>
+    '<div class="card ' + c.cls + '">' +
+    '<div class="label">' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+}
+
+function renderRenewablesChart(data) {
+  const labels  = data.dates;
+  const epfIdx  = labels.indexOf('2026-02-28');
+  const hormIdx = labels.indexOf('2026-03-02');
+
+  const datasets = data.datasets.map(d => ({
+    label: d.label,
+    data: d.data.map(v => v === null ? 0 : v),
+    backgroundColor: d.color + 'bb',
+    borderColor: d.color,
+    borderWidth: 0.5,
+    fill: true,
+    pointRadius: 0,
+    tension: 0.2,
+    spanGaps: true,
+  }));
+
+  const ch = Chart.getChart('chartRenewables');
+  if (ch) ch.destroy();
+  new Chart(document.getElementById('chartRenewables'), {
+    type: 'line',
+    plugins: [eventLinesPlugin],
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 28 } },
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          position: 'top',
+          labels: { font: { size: 11 }, boxWidth: 12, padding: 8 }
+        },
+        eventLines: {
+          lines: [
+            { idx: epfIdx,  color: '#dc3545', label: 'Op. Epic Fury' },
+            { idx: hormIdx, color: '#fd7e14', label: 'Hormuz closed', below: true },
+          ]
+        },
+        tooltip: {
+          callbacks: {
+            title: items => {
+              const d = new Date(items[0].label + 'T12:00:00');
+              return d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
+            },
+            label: c => ' ' + c.dataset.label + ': ' + c.parsed.y.toFixed(0) + ' MW'
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            maxTicksLimit: 20, font: { size: 10 }, maxRotation: 45,
+            callback(val) {
+              const d = new Date(labels[val] + 'T12:00:00');
+              return d.toLocaleDateString('en-GB', {day:'numeric', month:'short'});
+            }
+          },
+          grid: { color: 'rgba(0,0,0,0.05)' }
+        },
+        y: {
+          stacked: true,
+          title: { display: true, text: 'MW (daily avg)', font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        }
+      }
+    }
+  });
+}
+</script>"""
+
+
+# ── Price Heatmap HTML/JS ─────────────────────────────────────────────────────
+
+def _heatmap_html():
+    return (
+        '<div id="price-heatmap" class="tab-panel">'
+        '<div class="crisis-context">'
+        '<p>NL day-ahead hourly prices (ENTSO&#8209;E A44) reshaped as a heatmap: '
+        'each row is one day, each column is one hour. '
+        'Green = cheap, yellow = moderate, red = expensive. '
+        'Red dashed line marks the 28&nbsp;Feb event boundary. '
+        'Hover a cell for the exact price.</p>'
+        '</div>'
+        '<div id="hm-loading" style="text-align:center;padding:80px 24px;color:#888">'
+        '<div class="spinner"></div>'
+        '<p style="margin-top:12px;font-size:13px">Fetching price heatmap data&hellip;</p>'
+        '</div>'
+        '<div id="hm-charts" class="container" style="display:none">'
+        '<div id="hm-cards" class="cards"></div>'
+        '<div class="section-title" style="margin-bottom:12px">Hourly price heatmap — NL day-ahead (1 Feb &rarr; yesterday)</div>'
+        '<div style="overflow-x:auto;margin-bottom:8px">'
+        '<canvas id="heatmapCanvas" style="display:block"></canvas>'
+        '</div>'
+        '<p style="font-size:11px;color:#888;margin-bottom:24px">'
+        'Source: ENTSO&#8209;E Transparency Platform. Day-ahead prices, NL bidding zone (10YNL----------L).</p>'
+        '</div>'
+        '<div id="heatmapTooltip" style="position:fixed;display:none;background:rgba(0,0,0,0.82);'
+        'color:#fff;padding:6px 10px;border-radius:4px;font-size:12px;'
+        'pointer-events:none;z-index:9999;white-space:nowrap"></div>'
+        '</div>'
+    )
+
+
+def _heatmap_js():
+    return """<script>
+let hmRequested = false;
+
+function loadHeatmapData() {
+  if (hmRequested) return;
+  hmRequested = true;
+  fetch('/api/heatmap')
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      document.getElementById('hm-loading').style.display = 'none';
+      document.getElementById('hm-charts').style.display  = 'block';
+      renderHeatmapKPIs(data);
+      renderHeatmapCanvas(data);
+    })
+    .catch(err => {
+      document.getElementById('hm-loading').innerHTML =
+        '<p style="color:#dc3545;margin-top:40px;font-size:13px">Failed to load: ' + err + '</p>';
+    });
+}
+
+function renderHeatmapKPIs(data) {
+  function fmtHour(h) { return String(h).padStart(2,'0') + ':00'; }
+  function fmtDate(ds) {
+    const d = new Date(ds + 'T12:00:00');
+    return d.toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric'});
+  }
+  const pctSign = data.pct_change !== null ? (data.pct_change >= 0 ? '+' : '') : '';
+  const cards = [
+    { label: 'Cheapest Hour (avg)',
+      value: fmtHour(data.cheapest_hour),
+      sub: (data.hour_avgs[data.cheapest_hour] || 0).toFixed(2) + ' \u20ac/MWh avg', cls: 'trough' },
+    { label: 'Most Expensive Hour (avg)',
+      value: fmtHour(data.expensive_hour),
+      sub: (data.hour_avgs[data.expensive_hour] || 0).toFixed(2) + ' \u20ac/MWh avg', cls: 'peak' },
+    { label: 'Highest Day Average',
+      value: data.biggest_day ? data.biggest_day[1].toFixed(2) + ' \u20ac' : '\u2014',
+      sub: data.biggest_day ? fmtDate(data.biggest_day[0]) : '', cls: 'peak' },
+    { label: 'Price Change Post-Event',
+      value: data.pct_change !== null ? pctSign + data.pct_change + '%' : '\u2014',
+      sub: (data.pre_avg ? '\u20ac' + data.pre_avg.toFixed(1) : '?') + ' \u2192 ' +
+           (data.post_avg ? '\u20ac' + data.post_avg.toFixed(1) : '?') + ' /MWh avg',
+      cls: (data.pct_change !== null && data.pct_change > 0) ? 'peak' : '' },
+  ];
+  document.getElementById('hm-cards').innerHTML = cards.map(c =>
+    '<div class="card ' + c.cls + '">' +
+    '<div class="label">' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+}
+
+function renderHeatmapCanvas(data) {
+  const nDays   = data.dates.length;
+  const nHours  = 24;
+  const cellW   = 28;
+  const cellH   = 15;
+  const topPad  = 28;
+  const leftPad = 72;
+  const botPad  = 34;
+  const logW    = leftPad + nHours * cellW;
+  const logH    = topPad + nDays * cellH + botPad;
+
+  const canvas = document.getElementById('heatmapCanvas');
+  const dpr    = window.devicePixelRatio || 1;
+  canvas.width        = logW * dpr;
+  canvas.height       = logH * dpr;
+  canvas.style.width  = logW + 'px';
+  canvas.style.height = logH + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  function priceColor(price) {
+    if (price === null || price === undefined) return '#2e2e3e';
+    const t  = Math.max(0, Math.min(1, (price - data.price_min) / (data.price_max - data.price_min)));
+    let r, g, b;
+    if (t < 0.5) {
+      const s = t * 2;
+      r = Math.round(34  + (234 - 34)  * s);
+      g = Math.round(197 + (179 - 197) * s);
+      b = Math.round(94  + (8   - 94)  * s);
+    } else {
+      const s = (t - 0.5) * 2;
+      r = Math.round(234 + (239 - 234) * s);
+      g = Math.round(179 + (68  - 179) * s);
+      b = Math.round(8   + (68  - 8)   * s);
+    }
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  // Hour headers
+  ctx.fillStyle = '#999';
+  ctx.font = '9px system-ui';
+  ctx.textAlign = 'center';
+  for (let h = 0; h < 24; h++) {
+    ctx.fillText(String(h).padStart(2,'0'), leftPad + h * cellW + cellW / 2, topPad - 7);
+  }
+
+  // Rows
+  for (let i = 0; i < nDays; i++) {
+    const y = topPad + i * cellH;
+    // Date label
+    ctx.fillStyle = '#999';
+    ctx.font = '9px system-ui';
+    ctx.textAlign = 'right';
+    const d = new Date(data.dates[i] + 'T12:00:00');
+    ctx.fillText(d.toLocaleDateString('en-GB',{day:'numeric',month:'short'}), leftPad - 4, y + cellH/2 + 3);
+    // Cells
+    for (let h = 0; h < 24; h++) {
+      ctx.fillStyle = priceColor(data.grid[i][h]);
+      ctx.fillRect(leftPad + h * cellW + 1, y + 1, cellW - 2, cellH - 2);
+    }
+    // Red dashed boundary after 28 Feb
+    if (data.dates[i] === '2026-02-28') {
+      ctx.save();
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 3]);
+      ctx.beginPath();
+      ctx.moveTo(leftPad, y + cellH);
+      ctx.lineTo(leftPad + 24 * cellW, y + cellH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+  }
+
+  // Color scale legend
+  const scaleY = topPad + nDays * cellH + 12;
+  const scaleW = nHours * cellW;
+  const grad   = ctx.createLinearGradient(leftPad, 0, leftPad + scaleW, 0);
+  grad.addColorStop(0,   '#22c55e');
+  grad.addColorStop(0.5, '#eab308');
+  grad.addColorStop(1,   '#ef4444');
+  ctx.fillStyle = grad;
+  ctx.fillRect(leftPad, scaleY, scaleW, 8);
+  ctx.fillStyle = '#999';
+  ctx.font = '9px system-ui';
+  ctx.textAlign = 'left';
+  ctx.fillText('\u20ac' + data.price_min.toFixed(0) + '/MWh', leftPad, scaleY + 20);
+  ctx.textAlign = 'right';
+  ctx.fillText('\u20ac' + data.price_max.toFixed(0) + '/MWh', leftPad + scaleW, scaleY + 20);
+  ctx.textAlign = 'center';
+  ctx.fillText('price scale', leftPad + scaleW / 2, scaleY + 20);
+
+  // Hover tooltip
+  const tooltip = document.getElementById('heatmapTooltip');
+  canvas.onmousemove = function(e) {
+    const rect  = canvas.getBoundingClientRect();
+    const scX   = logW / rect.width;
+    const scY   = logH / rect.height;
+    const mx    = (e.clientX - rect.left) * scX;
+    const my    = (e.clientY - rect.top)  * scY;
+    const h     = Math.floor((mx - leftPad) / cellW);
+    const i     = Math.floor((my - topPad)  / cellH);
+    if (h >= 0 && h < 24 && i >= 0 && i < nDays) {
+      const price = data.grid[i][h];
+      if (price !== null && price !== undefined) {
+        const hEnd = h + 1;
+        tooltip.textContent =
+          data.dates[i] + '  \u2014  ' +
+          String(h).padStart(2,'0') + ':00\u2013' + String(hEnd).padStart(2,'00') + ':00  \u2014  ' +
+          '\u20ac' + price.toFixed(2) + '/MWh';
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.pageX + 14) + 'px';
+        tooltip.style.top  = (e.pageY - 36) + 'px';
+        return;
+      }
+    }
+    tooltip.style.display = 'none';
+  };
+  canvas.onmouseleave = () => { tooltip.style.display = 'none'; };
+}
+</script>"""
+
+
 # ── HTML rendering ────────────────────────────────────────────────────────────
 
 def render_html(yesterday, points, da_prices):
@@ -670,6 +1510,9 @@ def render_html(yesterday, points, da_prices):
   <nav class="tab-nav">
     <button class="active" onclick="showTab('daily-imbalance', this)">Daily Imbalance</button>
     <button onclick="showTab('crisis-view', this)">Crisis View</button>
+    <button onclick="showTab('gas-storage', this)">Gas Storage</button>
+    <button onclick="showTab('renewables-nl', this)">Renewables NL</button>
+    <button onclick="showTab('price-heatmap', this)">Price Heatmap</button>
   </nav>
 
   <div id="daily-imbalance" class="tab-panel active">
@@ -736,6 +1579,9 @@ def render_html(yesterday, points, da_prices):
   </div><!-- /tab daily-imbalance -->
 
   CRISIS_VIEW_PLACEHOLDER
+  GAS_STORAGE_PLACEHOLDER
+  RENEWABLES_PLACEHOLDER
+  HEATMAP_PLACEHOLDER
 
   <script>
     function showTab(id, btn) {{
@@ -743,7 +1589,10 @@ def render_html(yesterday, points, da_prices):
       document.querySelectorAll('.tab-nav button').forEach(b => b.classList.remove('active'));
       document.getElementById(id).classList.add('active');
       btn.classList.add('active');
-      if (id === 'crisis-view') loadCrisisData();
+      if (id === 'crisis-view')   loadCrisisData();
+      if (id === 'gas-storage')   loadGasStorageData();
+      if (id === 'renewables-nl') loadRenewablesData();
+      if (id === 'price-heatmap') loadHeatmapData();
     }}
   </script>
 
@@ -815,21 +1664,33 @@ def render_html(yesterday, points, da_prices):
       }}
     }});
   </script>
+  SHARED_JS_PLACEHOLDER
   CRISIS_JS_PLACEHOLDER
+  GAS_STORAGE_JS_PLACEHOLDER
+  RENEWABLES_JS_PLACEHOLDER
+  HEATMAP_JS_PLACEHOLDER
 </body>
 </html>"""
-    html = html.replace("CRISIS_VIEW_PLACEHOLDER", _crisis_html())
-    html = html.replace("CRISIS_JS_PLACEHOLDER",   _crisis_js())
+    html = html.replace("CRISIS_VIEW_PLACEHOLDER",   _crisis_html())
+    html = html.replace("GAS_STORAGE_PLACEHOLDER",   _gas_storage_html())
+    html = html.replace("RENEWABLES_PLACEHOLDER",    _renewables_html())
+    html = html.replace("HEATMAP_PLACEHOLDER",       _heatmap_html())
+    html = html.replace("SHARED_JS_PLACEHOLDER",     _shared_js())
+    html = html.replace("CRISIS_JS_PLACEHOLDER",     _crisis_js())
+    html = html.replace("GAS_STORAGE_JS_PLACEHOLDER", _gas_storage_js())
+    html = html.replace("RENEWABLES_JS_PLACEHOLDER", _renewables_js())
+    html = html.replace("HEATMAP_JS_PLACEHOLDER",    _heatmap_js())
     return html
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/api/crisis":
-            self._serve_crisis_api()
-        else:
-            self._serve_dashboard()
+        if   self.path == "/api/crisis":      self._serve_crisis_api()
+        elif self.path == "/api/gas-storage": self._serve_json_api(build_gas_storage_data, _gas_cache)
+        elif self.path == "/api/renewables":  self._serve_json_api(build_renewables_data,  _renewables_cache)
+        elif self.path == "/api/heatmap":     self._serve_json_api(build_heatmap_data,     _heatmap_cache)
+        else:                                 self._serve_dashboard()
 
     def _serve_dashboard(self):
         try:
@@ -842,6 +1703,26 @@ class Handler(BaseHTTPRequestHandler):
             body = f"<pre>Error: {e}\n\n{traceback.format_exc()}</pre>".encode("utf-8")
             self.send_response(500)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_json_api(self, builder, cache):
+        """Generic cached JSON API endpoint."""
+        today = str(date.today())
+        if cache["date"] == today and cache["data"] is not None:
+            data = cache["data"]
+        else:
+            try:
+                data = builder()
+                cache["data"] = data
+                cache["date"] = today
+            except Exception as exc:
+                import traceback
+                data = {"error": str(exc), "detail": traceback.format_exc()}
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
