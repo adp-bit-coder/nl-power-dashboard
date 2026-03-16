@@ -19,6 +19,7 @@ load_dotenv()
 tennet_key = os.getenv("TENNET_API_KEY")
 entsoe_key = os.getenv("ENTSOE_API_KEY")
 agsi_key   = os.getenv("AGSI_API_KEY")
+windy_key  = os.getenv("WINDY_API_KEY")
 
 REG_LABELS = {1: "UP", -1: "DOWN", 0: "STABLE", 2: "UP+DOWN"}
 REG_COLORS = {1: "#d4edda", -1: "#d1ecf1", 0: "#f8f9fa", 2: "#fff3cd"}
@@ -66,6 +67,7 @@ FOSSIL_CODES    = {"B02", "B04", "B05", "B06"}
 _gas_cache        = {"data": None, "date": None}
 _renewables_cache = {"data": None, "date": None}
 _heatmap_cache    = {"data": None, "date": None}
+_wsd_cache        = {"data": None, "date": None}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -504,6 +506,272 @@ def build_heatmap_data():
         "post_avg":       post_avg,
         "pct_change":     pct_change,
         "as_of":          str(yesterday),
+    }
+
+
+# ── Weather, Supply & Demand ──────────────────────────────────────────────────
+
+WSD_GEN_TYPES = [
+    ("B04", "Fossil Gas",    "#FF6B6B"),
+    ("B14", "Nuclear",       "#9B59B6"),
+    ("B01", "Biomass",       "#A3C97A"),
+    ("B19", "Wind Onshore",  "#4FC3F7"),
+    ("B18", "Wind Offshore", "#1E90FF"),
+    ("B16", "Solar",         "#FFD700"),
+]
+
+
+def parse_entsoe_load(xml_text):
+    """Parse ENTSO-E A65 XML → [(utc_dt, mw), ...]. Uses {*} wildcard for namespace."""
+    root   = ET.fromstring(xml_text)
+    result = []
+    for ts in root.findall(".//{*}TimeSeries"):
+        for period in ts.findall(".//{*}Period"):
+            start_el = period.find(".//{*}start")
+            res_el   = period.find("{*}resolution")
+            if start_el is None or res_el is None:
+                continue
+            start_dt = datetime.fromisoformat(start_el.text.replace("Z", "+00:00"))
+            delta    = timedelta(hours=1) if res_el.text == "PT60M" else timedelta(minutes=15)
+            for pt in period.findall("{*}Point"):
+                pos_el = pt.find("{*}position")
+                qty_el = pt.find("{*}quantity")
+                if pos_el is None or qty_el is None:
+                    continue
+                result.append(
+                    (start_dt + (int(pos_el.text) - 1) * delta, float(qty_el.text)))
+    return sorted(result, key=lambda x: x[0])
+
+
+def build_wsd_data():
+    """Fetch today's supply/demand + 3-day weather for the WSD tab."""
+    today     = date.today()
+    yesterday = today - timedelta(days=1)
+    day_b4yest = today - timedelta(days=2)
+
+    period_start  = yesterday.strftime("%Y%m%d") + "2300"   # today 00:00 CET
+    period_end    = today.strftime("%Y%m%d")    + "2300"    # today 24:00 CET
+    da_start_3day = day_b4yest.strftime("%Y%m%d") + "2300"
+    da_end_3day   = (today + timedelta(days=1)).strftime("%Y%m%d") + "2300"
+
+    def fetch_load():
+        try:
+            params = {
+                "securityToken":         entsoe_key,
+                "documentType":          "A65",
+                "processType":           "A16",
+                "outBiddingZone_Domain": NL_ZONE,
+                "periodStart":           period_start,
+                "periodEnd":             period_end,
+            }
+            resp = requests.get("https://web-api.tp.entsoe.eu/api", params=params, timeout=20)
+            resp.raise_for_status()
+            return parse_entsoe_load(resp.text)
+        except Exception as exc:
+            print(f"[WSD load] {exc}", flush=True)
+            return []
+
+    def fetch_da_3day():
+        try:
+            return fetch_entsoe_period(NL_ZONE, da_start_3day, da_end_3day)
+        except Exception as exc:
+            print(f"[WSD da-3day] {exc}", flush=True)
+            return []
+
+    def fetch_openmeteo():
+        try:
+            params = {
+                "latitude":      52.3,
+                "longitude":     5.3,
+                "hourly":        "direct_radiation,windspeed_100m",
+                "timezone":      "Europe/Amsterdam",
+                "forecast_days": 3,
+            }
+            resp = requests.get("https://api.open-meteo.com/v1/forecast",
+                                params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            print(f"[WSD openmeteo] {exc}", flush=True)
+            return None
+
+    def fetch_windy():
+        if not windy_key:
+            return None
+        try:
+            payload = {
+                "lat":        52.3,
+                "lon":        5.3,
+                "model":      "ecmwf",
+                "parameters": ["wind"],
+                "levels":     ["100m"],
+                "key":        windy_key,
+            }
+            resp = requests.post(
+                "https://api.windy.com/api/point-forecast/v2",
+                json=payload, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            print(f"[WSD windy] {exc}", flush=True)
+            return None
+
+    # Run all fetches + generation types in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        load_fut  = ex.submit(fetch_load)
+        da_fut    = ex.submit(fetch_da_3day)
+        meteo_fut = ex.submit(fetch_openmeteo)
+        windy_fut = ex.submit(fetch_windy)
+        gen_futs  = {code: ex.submit(_fetch_gen_type, (code, period_start, period_end))
+                     for code, _, _ in WSD_GEN_TYPES}
+
+        load_pts = load_fut.result()
+        da_pts   = da_fut.result()
+        meteo    = meteo_fut.result()
+        windy    = windy_fut.result()
+        gen_raw  = {}
+        for code, _, _ in WSD_GEN_TYPES:
+            c, pts = gen_futs[code].result()
+            gen_raw[code] = pts
+
+    # Build 96-slot 15-min CET time axis for today
+    # Slot 0 = 00:00 CET = yesterday 23:00 UTC
+    day_start_utc = datetime(
+        yesterday.year, yesterday.month, yesterday.day, 23, 0, tzinfo=timezone.utc)
+    slot_labels = [
+        (day_start_utc + timedelta(minutes=15 * i)).astimezone(CET).strftime("%H:%M")
+        for i in range(96)
+    ]
+
+    def pts_to_96(pts):
+        """Map (utc_dt, mw) list into 96-slot CET today array."""
+        arr = [None] * 96
+        for dt, mw in pts:
+            cet_dt = dt.astimezone(CET)
+            if cet_dt.date() == today:
+                idx = (cet_dt.hour * 60 + cet_dt.minute) // 15
+                if 0 <= idx < 96:
+                    arr[idx] = round(mw, 1)
+        return arr
+
+    load_data = pts_to_96(load_pts)
+    gen_data  = {code: pts_to_96(gen_raw[code]) for code, _, _ in WSD_GEN_TYPES}
+
+    total_gen = []
+    for i in range(96):
+        has_any = any(gen_data[c][i] is not None for c, _, _ in WSD_GEN_TYPES)
+        total   = sum((gen_data[c][i] or 0) for c, _, _ in WSD_GEN_TYPES
+                      if gen_data[c][i] is not None)
+        total_gen.append(round(total, 1) if has_any else None)
+
+    # "Now" index in the 96-slot axis
+    now_cet   = datetime.now(timezone.utc).astimezone(CET)
+    now_idx   = min((now_cet.hour * 60 + now_cet.minute) // 15, 95)
+    now_label = now_cet.strftime("%H:%M")
+
+    def last_val(arr):
+        for v in reversed(arr):
+            if v is not None:
+                return v
+        return None
+
+    current_load   = last_val(load_data)
+    current_gen    = last_val(total_gen)
+    system_balance = (round(current_gen - current_load, 0)
+                      if current_gen is not None and current_load is not None else None)
+
+    # Open-Meteo: solar irradiance + wind fallback (hourly, 3-day)
+    wx_labels    = []
+    solar_data   = []
+    wind_om_data = []
+    if meteo and "hourly" in meteo:
+        h     = meteo["hourly"]
+        times = h.get("time", [])
+        rad   = h.get("direct_radiation", [])
+        wsp   = h.get("windspeed_100m", [])
+        for i, t in enumerate(times):
+            wx_labels.append(t[5:])                              # "MM-DDTHH:MM"
+            solar_data.append(rad[i] if i < len(rad) else None)
+            v = wsp[i] if i < len(wsp) else None
+            wind_om_data.append(round(v / 3.6, 1) if v is not None else None)
+
+    # Windy override for wind speed
+    wind_labels = wx_labels
+    wind_data   = wind_om_data
+    if windy:
+        try:
+            ts_list = windy.get("ts", [])
+            wu = windy.get("wind_u-100m", [])
+            wv = windy.get("wind_v-100m", [])
+            if ts_list and wu and wv:
+                wsd_wind = [round((u ** 2 + v ** 2) ** 0.5, 1) for u, v in zip(wu, wv)]
+                wind_labels = []
+                wind_data   = []
+                for i, ts_ms in enumerate(ts_list):
+                    dt_cet = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(CET)
+                    wind_labels.append(dt_cet.strftime("%m-%dT%H:%M"))
+                    wind_data.append(wsd_wind[i] if i < len(wsd_wind) else None)
+        except Exception as exc:
+            print(f"[WSD windy parse] {exc}", flush=True)
+
+    peak_wind = max((v for v in wind_data if v is not None), default=None)
+    if peak_wind is not None:
+        peak_wind = round(peak_wind, 1)
+
+    # DA prices for 3-day overlay on weather chart (hourly, keyed to wx_labels)
+    da_wx_data = []
+    if da_pts and wx_labels:
+        by_hour = {}
+        for dt, price in da_pts:
+            cet_dt = dt.astimezone(CET)
+            key = cet_dt.strftime("%m-%dT%H:00")
+            by_hour[key] = round(price, 2)
+        for lbl in wx_labels:
+            # Match hourly bucket: "MM-DDTHH:MM" → look up "MM-DDTHH:00"
+            key = lbl[:8] + ":00"
+            da_wx_data.append(by_hour.get(key))
+
+    # Observations
+    obs = []
+    if system_balance is not None:
+        direction = "surplus" if system_balance > 0 else "shortfall"
+        obs.append(
+            f"Tracked 6-type generation ({current_gen:.0f}\u00a0MW) shows a "
+            f"{abs(system_balance):.0f}\u00a0MW {direction} vs total load ({current_load:.0f}\u00a0MW) "
+            f"as of {now_label}\u00a0CET. The gap is covered by untracked types and cross-border imports.")
+    max_solar = max((v for v in solar_data if v is not None), default=None)
+    if max_solar is not None:
+        obs.append(
+            f"Peak solar irradiance over the 3-day forecast: {max_solar:.0f}\u00a0W/m\u00b2.")
+    if peak_wind is not None:
+        obs.append(
+            f"Peak 100\u00a0m wind speed forecast: {peak_wind}\u00a0m/s "
+            f"({'Windy ECMWF' if windy else 'Open-Meteo'}).")
+    if not obs:
+        obs.append(
+            "Insufficient live data \u2014 ENTSO-E generation data may not be available yet.")
+
+    return {
+        "slot_labels":  slot_labels,
+        "load_data":    load_data,
+        "total_gen":    total_gen,
+        "gen_series":   gen_data,
+        "gen_types":    [{"code": c, "label": l, "color": col}
+                         for c, l, col in WSD_GEN_TYPES],
+        "now_idx":      now_idx,
+        "now_label":    now_label,
+        "wx_labels":    wx_labels,
+        "solar_data":   solar_data,
+        "wind_labels":  wind_labels,
+        "wind_data":    wind_data,
+        "da_wx_data":   da_wx_data,
+        "kpis": {
+            "current_load":    current_load,
+            "current_gen":     current_gen,
+            "system_balance":  system_balance,   # 6-type gen minus load
+            "peak_wind":       peak_wind,
+        },
+        "observations": obs,
     }
 
 
@@ -1342,6 +1610,382 @@ function renderHeatmapCanvas(data) {
 </script>"""
 
 
+# ── Weather, Supply & Demand HTML/JS ─────────────────────────────────────────
+
+def _wsd_html():
+    return (
+        '<div id="wsd" class="tab-panel">'
+        '<div class="crisis-context">'
+        '<p>Live Netherlands electricity supply &amp; demand and 3-day weather forecast. '
+        'Sources: ENTSO&#8209;E A65 (actual load) &amp; A75 (generation mix today), '
+        'Open&#8209;Meteo (solar irradiance &amp; 100&#8209;m wind). '
+        'Data is cached daily; live values reflect the latest available ENTSO&#8209;E reading.</p>'
+        '</div>'
+        '<div id="wsd-loading" style="text-align:center;padding:80px 24px;color:#888">'
+        '<div class="spinner"></div>'
+        '<p style="margin-top:12px;font-size:13px">Fetching supply &amp; demand data&hellip;</p>'
+        '</div>'
+        '<div id="wsd-charts" class="container" style="display:none">'
+        # KPI cards
+        '<div id="wsd-cards" class="cards"></div>'
+        # Supply vs Demand
+        '<div class="section-title">Supply vs demand &mdash; today (15-min resolution, MW)</div>'
+        '<div class="chart-wrap" style="height:260px">'
+        '<canvas id="chartWsdBalance"></canvas>'
+        '</div>'
+        # Generation mix
+        '<div class="section-title">Generation mix &mdash; today (stacked area, MW)</div>'
+        '<div class="chart-wrap" style="height:300px">'
+        '<canvas id="chartWsdMix"></canvas>'
+        '</div>'
+        # Weather (solar + wind + DA price)
+        '<div class="section-title">Weather &amp; DA price &mdash; 3-day forecast</div>'
+        '<div class="chart-wrap" style="height:280px">'
+        '<canvas id="chartWsdWeather"></canvas>'
+        '</div>'
+        '<p style="font-size:11px;color:#888;margin:-16px 0 20px 4px">'
+        'Solar irradiance (W/m\u00b2, right axis) &bull; Wind speed at 100\u00a0m (m/s, left axis) &bull; '
+        'DA price \u20ac/MWh (right axis, amber). Source: Open-Meteo &amp; ENTSO-E A44.</p>'
+        # Observations
+        '<div class="section-title">Observations</div>'
+        '<div id="wsd-obs" style="background:#1a1a3a;border-left:3px solid #4f8ef7;'
+        'color:#aaa;font-size:12px;line-height:1.9;padding:12px 20px;margin-bottom:8px;'
+        'border-radius:0 6px 6px 0"></div>'
+        '<p style="font-size:11px;color:#666;padding:0 4px;margin-bottom:24px">'
+        'Disclaimer: observations are auto-generated from live API data. '
+        'Values are indicative only and may differ from official TSO publications.</p>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _wsd_js():
+    return """<script>
+let wsdRequested = false;
+
+function loadWSDData() {
+  if (wsdRequested) return;
+  wsdRequested = true;
+  fetch('/api/wsd')
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      document.getElementById('wsd-loading').style.display = 'none';
+      document.getElementById('wsd-charts').style.display  = 'block';
+      renderWSDKPIs(data);
+      renderWSDBalance(data);
+      renderWSDMix(data);
+      renderWSDWeather(data);
+      renderWSDObs(data);
+    })
+    .catch(err => {
+      document.getElementById('wsd-loading').innerHTML =
+        '<p style="color:#dc3545;margin-top:40px;font-size:13px">Failed to load: ' + err + '</p>';
+    });
+}
+
+function renderWSDKPIs(data) {
+  const k = data.kpis;
+  const fmt = v => v != null ? Math.round(v).toLocaleString() + '\u00a0MW' : '\u2014';
+  const bal = k.system_balance;
+  const balFmt = bal != null
+    ? (bal >= 0 ? '+' : '') + Math.round(bal).toLocaleString() + '\u00a0MW'
+    : '\u2014';
+  const balCls = bal == null ? '' : bal >= 0 ? '' : 'peak';
+  const cards = [
+    { label: 'Current Load',       value: fmt(k.current_load),   sub: 'latest ENTSO-E reading', cls: '' },
+    { label: 'Current Generation', value: fmt(k.current_gen),    sub: '6-type sum (today)',      cls: '' },
+    { label: 'Balance (6-type gen \u2212 load)', value: balFmt, sub: '+ surplus  \u2212 deficit (excl. imports)', cls: balCls },
+    { label: 'Peak Wind Forecast', value: k.peak_wind != null ? k.peak_wind + '\u00a0m/s' : '\u2014',
+      sub: '100m hub height, 3-day', cls: '' },
+  ];
+  document.getElementById('wsd-cards').innerHTML = cards.map(c =>
+    '<div class="card ' + c.cls + '">' +
+    '<div class="label">' + c.label + '</div>' +
+    '<div class="value">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+}
+
+// Inline "Now" vertical-line plugin (only used in WSD tab)
+const nowLinePlugin = {
+  id: 'nowLine',
+  afterDatasetsDraw(chart, _args, opts) {
+    if (!opts || opts.idx == null) return;
+    const {ctx, scales, chartArea} = chart;
+    const x = scales.x.getPixelForValue(opts.idx);
+    if (x < chartArea.left || x > chartArea.right) return;
+    ctx.save();
+    ctx.strokeStyle = '#facc15';
+    ctx.lineWidth   = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, chartArea.top);
+    ctx.lineTo(x, chartArea.bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#facc15';
+    ctx.font = 'bold 10px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('\u25bc ' + opts.label, x, chartArea.top - 6);
+    ctx.restore();
+  }
+};
+
+function renderWSDBalance(data) {
+  const ch = Chart.getChart('chartWsdBalance');
+  if (ch) ch.destroy();
+  new Chart(document.getElementById('chartWsdBalance'), {
+    type: 'line',
+    plugins: [nowLinePlugin],
+    data: {
+      labels: data.slot_labels,
+      datasets: [
+        {
+          label: 'Total Load (MW)',
+          data: data.load_data,
+          borderColor: '#2196F3',
+          backgroundColor: 'rgba(33,150,243,0.07)',
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: true,
+          tension: 0.3,
+          spanGaps: true,
+          order: 1,
+        },
+        {
+          label: 'Total Generation (MW)',
+          data: data.total_gen,
+          borderColor: '#4CAF50',
+          backgroundColor: 'rgba(76,175,80,0.10)',
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: true,
+          tension: 0.3,
+          spanGaps: true,
+          order: 2,
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 11 } } },
+        nowLine: { idx: data.now_idx, label: data.now_label },
+        tooltip: {
+          callbacks: {
+            label: c => ' ' + c.dataset.label + ': ' +
+              (c.parsed.y != null ? c.parsed.y.toLocaleString() + ' MW' : '\u2014')
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { maxTicksLimit: 24, font: { size: 10 }, maxRotation: 0 },
+          grid:  { color: 'rgba(0,0,0,0.04)' }
+        },
+        y: {
+          title: { display: true, text: 'MW', font: { size: 11 } },
+          ticks: { font: { size: 11 }, callback: v => (v/1000).toFixed(1) + 'k' },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        }
+      }
+    }
+  });
+}
+
+function renderWSDMix(data) {
+  const ch = Chart.getChart('chartWsdMix');
+  if (ch) ch.destroy();
+  const datasets = data.gen_types.map(t => ({
+    label: t.label,
+    data: data.gen_series[t.code] || [],
+    backgroundColor: t.color + 'bb',
+    borderColor: t.color,
+    borderWidth: 0.5,
+    fill: true,
+    pointRadius: 0,
+    tension: 0.2,
+    spanGaps: true,
+    stack: 'gen',
+  }));
+  // Load overlay — separate stack group so it renders at its true value
+  datasets.push({
+    label: 'Total Load',
+    data: data.load_data,
+    borderColor: '#fff',
+    backgroundColor: 'transparent',
+    borderWidth: 2.5,
+    borderDash: [6, 3],
+    pointRadius: 0,
+    fill: false,
+    tension: 0.3,
+    spanGaps: true,
+    stack: 'load',
+  });
+  new Chart(document.getElementById('chartWsdMix'), {
+    type: 'line',
+    plugins: [nowLinePlugin],
+    data: { labels: data.slot_labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 11 }, boxWidth: 12, padding: 8 } },
+        nowLine: { idx: data.now_idx, label: data.now_label },
+        tooltip: {
+          callbacks: {
+            label: c => ' ' + c.dataset.label + ': ' +
+              (c.parsed.y != null ? c.parsed.y.toLocaleString() + ' MW' : '\u2014')
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { maxTicksLimit: 24, font: { size: 10 }, maxRotation: 0 },
+          grid:  { color: 'rgba(0,0,0,0.04)' }
+        },
+        y: {
+          stacked: true,
+          title: { display: true, text: 'MW', font: { size: 11 } },
+          ticks: { font: { size: 11 }, callback: v => (v/1000).toFixed(1) + 'k' },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        }
+      }
+    }
+  });
+}
+
+function renderWSDWeather(data) {
+  const ch = Chart.getChart('chartWsdWeather');
+  if (ch) ch.destroy();
+  if (!data.wx_labels || !data.wx_labels.length) return;
+
+  const datasets = [
+    {
+      label: 'Wind 100m (m/s)',
+      data: data.wind_data,
+      type: 'line',
+      borderColor: '#60a5fa',
+      backgroundColor: 'rgba(96,165,250,0.18)',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.4,
+      spanGaps: true,
+      yAxisID: 'y',
+      order: 2,
+    },
+    {
+      label: 'Solar (W/m\u00b2)',
+      data: data.solar_data,
+      type: 'bar',
+      backgroundColor: 'rgba(253,224,71,0.55)',
+      borderColor: '#fbbf24',
+      borderWidth: 0.5,
+      yAxisID: 'y1',
+      order: 3,
+    },
+  ];
+  if (data.da_wx_data && data.da_wx_data.some(v => v != null)) {
+    datasets.push({
+      label: 'DA Price (\u20ac/MWh)',
+      data: data.da_wx_data,
+      type: 'line',
+      borderColor: '#f97316',
+      backgroundColor: 'transparent',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: false,
+      tension: 0.3,
+      spanGaps: true,
+      yAxisID: 'y2',
+      order: 1,
+    });
+  }
+
+  // Tick formatter: show date change "MM-DD" if hour==0, else "HH:MM"
+  const labels = data.wx_labels;
+  new Chart(document.getElementById('chartWsdWeather'), {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 11 }, boxWidth: 12, padding: 8 } },
+        tooltip: {
+          callbacks: {
+            title: items => {
+              const raw = items[0].label || '';
+              return raw.replace('T', ' ');
+            },
+            label: c => {
+              const v = c.parsed.y;
+              if (v == null) return null;
+              if (c.dataset.label.startsWith('Wind'))   return ' Wind: ' + v.toFixed(1) + ' m/s';
+              if (c.dataset.label.startsWith('Solar'))  return ' Solar: ' + v.toFixed(0) + ' W/m\u00b2';
+              if (c.dataset.label.startsWith('DA'))     return ' DA: \u20ac' + v.toFixed(2) + '/MWh';
+              return ' ' + v;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            maxTicksLimit: 18, font: { size: 10 }, maxRotation: 45,
+            callback(val) {
+              const lbl = labels[val] || '';
+              // e.g. "03-16T06:00" → show "06:00" or date on midnight
+              const parts = lbl.split('T');
+              if (parts.length < 2) return lbl;
+              return parts[1] === '00:00' ? parts[0] : parts[1];
+            }
+          },
+          grid: { color: 'rgba(0,0,0,0.04)' }
+        },
+        y: {
+          position: 'left',
+          title: { display: true, text: 'Wind (m/s)', font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid:  { color: 'rgba(0,0,0,0.05)' }
+        },
+        y1: {
+          position: 'right',
+          title: { display: true, text: 'Solar (W/m\u00b2)', font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid:  { drawOnChartArea: false }
+        },
+        y2: {
+          position: 'right',
+          title: { display: true, text: '\u20ac/MWh', font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid:  { drawOnChartArea: false },
+          offset: true,
+        },
+      }
+    }
+  });
+}
+
+function renderWSDObs(data) {
+  const el = document.getElementById('wsd-obs');
+  if (!data.observations || !data.observations.length) {
+    el.textContent = 'No observations available.';
+    return;
+  }
+  el.innerHTML = data.observations
+    .map((o, i) => '<strong>' + (i + 1) + '.</strong> ' + o)
+    .join('<br>');
+}
+</script>"""
+
+
 # ── HTML rendering ────────────────────────────────────────────────────────────
 
 def render_html(yesterday, points, da_prices):
@@ -1513,6 +2157,7 @@ def render_html(yesterday, points, da_prices):
     <button onclick="showTab('gas-storage', this)">Gas Storage</button>
     <button onclick="showTab('renewables-nl', this)">Renewables NL</button>
     <button onclick="showTab('price-heatmap', this)">Price Heatmap</button>
+    <button onclick="showTab('wsd', this)">Weather &amp; Supply</button>
   </nav>
 
   <div id="daily-imbalance" class="tab-panel active">
@@ -1582,6 +2227,7 @@ def render_html(yesterday, points, da_prices):
   GAS_STORAGE_PLACEHOLDER
   RENEWABLES_PLACEHOLDER
   HEATMAP_PLACEHOLDER
+  WSD_PLACEHOLDER
 
   <script>
     function showTab(id, btn) {{
@@ -1593,6 +2239,7 @@ def render_html(yesterday, points, da_prices):
       if (id === 'gas-storage')   loadGasStorageData();
       if (id === 'renewables-nl') loadRenewablesData();
       if (id === 'price-heatmap') loadHeatmapData();
+      if (id === 'wsd')           loadWSDData();
     }}
   </script>
 
@@ -1669,17 +2316,20 @@ def render_html(yesterday, points, da_prices):
   GAS_STORAGE_JS_PLACEHOLDER
   RENEWABLES_JS_PLACEHOLDER
   HEATMAP_JS_PLACEHOLDER
+  WSD_JS_PLACEHOLDER
 </body>
 </html>"""
     html = html.replace("CRISIS_VIEW_PLACEHOLDER",   _crisis_html())
     html = html.replace("GAS_STORAGE_PLACEHOLDER",   _gas_storage_html())
     html = html.replace("RENEWABLES_PLACEHOLDER",    _renewables_html())
     html = html.replace("HEATMAP_PLACEHOLDER",       _heatmap_html())
+    html = html.replace("WSD_PLACEHOLDER",           _wsd_html())
     html = html.replace("SHARED_JS_PLACEHOLDER",     _shared_js())
     html = html.replace("CRISIS_JS_PLACEHOLDER",     _crisis_js())
     html = html.replace("GAS_STORAGE_JS_PLACEHOLDER", _gas_storage_js())
     html = html.replace("RENEWABLES_JS_PLACEHOLDER", _renewables_js())
     html = html.replace("HEATMAP_JS_PLACEHOLDER",    _heatmap_js())
+    html = html.replace("WSD_JS_PLACEHOLDER",        _wsd_js())
     return html
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -1690,6 +2340,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/gas-storage": self._serve_json_api(build_gas_storage_data, _gas_cache)
         elif self.path == "/api/renewables":  self._serve_json_api(build_renewables_data,  _renewables_cache)
         elif self.path == "/api/heatmap":     self._serve_json_api(build_heatmap_data,     _heatmap_cache)
+        elif self.path == "/api/wsd":         self._serve_json_api(build_wsd_data,         _wsd_cache)
         else:                                 self._serve_dashboard()
 
     def _serve_dashboard(self):
