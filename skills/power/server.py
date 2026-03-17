@@ -68,6 +68,7 @@ _gas_cache        = {"data": None, "date": None}
 _renewables_cache = {"data": None, "date": None}
 _heatmap_cache    = {"data": None, "date": None}
 _wsd_cache        = {"data": None, "date": None}
+_regdetail_cache  = {"data": None, "date": None}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -644,14 +645,17 @@ def build_wsd_data():
     ]
 
     def pts_to_96(pts):
-        """Map (utc_dt, mw) list into 96-slot CET today array."""
+        """Map (utc_dt, mw) list into 96-slot CET today array.
+        Accumulates across multiple TimeSeries for the same slot (ENTSO-E
+        returns one TimeSeries per generating unit under the same psrType,
+        e.g. two separate B04 gas plants → must be summed, not overwritten)."""
         arr = [None] * 96
         for dt, mw in pts:
             cet_dt = dt.astimezone(CET)
             if cet_dt.date() == today:
                 idx = (cet_dt.hour * 60 + cet_dt.minute) // 15
                 if 0 <= idx < 96:
-                    arr[idx] = round(mw, 1)
+                    arr[idx] = round((arr[idx] or 0) + mw, 1)
         return arr
 
     load_data = pts_to_96(load_pts)
@@ -772,6 +776,189 @@ def build_wsd_data():
             "peak_wind":       peak_wind,
         },
         "observations": obs,
+    }
+
+
+# ── Regulation Detail (FRR Activations + Settlement Prices) ──────────────────
+
+def build_regdetail_data():
+    """Fetch TenneT FRR activations + settlement prices + DA prices in parallel."""
+    yesterday = date.today() - timedelta(days=1)
+    date_str  = yesterday.strftime('%d-%m-%Y')
+
+    def fetch_frr():
+        url     = "https://api.tennet.eu/publications/v1/frequency-restoration-reserve-activations"
+        params  = {"date_from": f"{date_str} 00:00:00",
+                   "date_to":   f"{date_str} 23:59:59"}
+        headers = {"apikey": tennet_key, "Accept": "application/json"}
+        resp    = requests.get(url, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()["Response"]["TimeSeries"][0]["Period"]["Points"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        frr_fut   = ex.submit(fetch_frr)
+        price_fut = ex.submit(fetch_tennet, yesterday)
+        da_fut    = ex.submit(fetch_entsoe_da, yesterday)
+        price_points = price_fut.result()   # bubble up on failure
+        da_prices    = da_fut.result()
+        frr_error    = None
+        frr_points   = None
+        try:
+            frr_points = frr_fut.result()
+        except Exception as exc:
+            frr_error = str(exc)
+            print(f"[REGDETAIL frr] {exc}", flush=True)
+
+    # Index FRR by timeInterval_start for O(1) lookup
+    frr_idx = {p["timeInterval_start"]: p for p in (frr_points or [])}
+
+    # Align datasets per PTU
+    ptus       = []
+    labels     = []
+    shortage_s = []
+    surplus_s  = []
+    da_s       = []
+    up_mw_s    = []
+    down_mw_s  = []
+
+    for i, p in enumerate(price_points):
+        ts  = p.get("timeInterval_start", "")
+        lbl = ts[11:16] if len(ts) >= 16 else f"{i*15//60:02d}:{i*15%60:02d}"
+        labels.append(lbl)
+
+        sh  = safe_float(p.get("shortage"))
+        sur = safe_float(p.get("surplus"))
+        da  = da_prices[i] if i < len(da_prices) else None
+        shortage_s.append(sh)
+        surplus_s.append(sur)
+        da_s.append(da)
+
+        frr = frr_idx.get(ts)
+        if frr:
+            au   = (safe_float(frr.get("aFRR_up"))          or 0) + \
+                   (safe_float(frr.get("mfrrda_volume_up"))  or 0)
+            ad   = (safe_float(frr.get("aFRR_down"))         or 0) + \
+                   (safe_float(frr.get("mfrrda_volume_down")) or 0)
+            up   = round(au / 250, 1)
+            down = round(ad / 250, 1)   # negative value preserved
+        else:
+            up = down = None
+        up_mw_s.append(up)
+        down_mw_s.append(down)
+
+        ptus.append({
+            "time":   lbl,
+            "reg":    p.get("regulation_state"),
+            "short":  round(sh,  2) if sh  is not None else None,
+            "surp":   round(sur, 2) if sur is not None else None,
+            "da":     round(da,  2) if da  is not None else None,
+            "up_mw":  up,
+            "dn_mw":  down,
+            "net_mw": round((up or 0) + (down or 0), 1),
+        })
+
+    # ── KPIs ─────────────────────────────────────────────────────────────────
+    if frr_points:
+        total_up_kwh   = sum((safe_float(p.get("aFRR_up"))          or 0) +
+                             (safe_float(p.get("mfrrda_volume_up"))  or 0)
+                             for p in frr_points)
+        total_down_kwh = sum((safe_float(p.get("aFRR_down"))         or 0) +
+                             (safe_float(p.get("mfrrda_volume_down")) or 0)
+                             for p in frr_points)
+        total_up_mwh   = round(total_up_kwh   / 1000, 1)
+        total_down_mwh = round(abs(total_down_kwh) / 1000, 1)
+        net_mwh        = round((total_up_kwh + total_down_kwh) / 1000, 1)
+
+        peak_frr = max(frr_points,
+                       key=lambda p: abs(safe_float(p.get("absolute_total_volume")) or 0))
+        peak_atv = (safe_float(peak_frr.get("absolute_total_volume")) or 0) / 250
+        peak_au  =  safe_float(peak_frr.get("aFRR_up"))  or 0
+        peak_ad  = abs(safe_float(peak_frr.get("aFRR_down")) or 0)
+        peak_ts  = peak_frr.get("timeInterval_start", "")
+        peak_ptu = {
+            "time": peak_ts[11:16] if len(peak_ts) >= 16 else "?",
+            "dir":  "UP" if peak_au >= peak_ad else "DOWN",
+            "mw":   round(peak_atv, 1),
+        }
+    else:
+        total_up_mwh = total_down_mwh = net_mwh = 0.0
+        peak_ptu = None
+
+    # ── Observations ──────────────────────────────────────────────────────────
+    obs = []
+
+    # 1 — Largest activation hour and proportional price response
+    if frr_points and peak_ptu:
+        peak_ts_full = next(
+            (p["timeInterval_start"] for p in frr_points
+             if p["timeInterval_start"][11:16] == peak_ptu["time"]), "")
+        price_at_peak = next(
+            (safe_float(p.get("shortage"))
+             for p in price_points
+             if p.get("timeInterval_start", "") == peak_ts_full), None)
+        price_str = f"{price_at_peak:.2f}\u00a0\u20ac/MWh" if price_at_peak is not None else "unknown"
+        proportional = price_at_peak is not None and abs(price_at_peak) > 50
+        obs.append(
+            f"Largest activation at {peak_ptu['time']}\u00a0CET: "
+            f"{peak_ptu['mw']:.0f}\u00a0MW ({peak_ptu['dir']} aFRR). "
+            f"Settlement price at that PTU: {price_str}. "
+            + ("The price response was proportional \u2014 tight reserve at that hour."
+               if proportional else
+               "The price response was muted relative to activation volume, "
+               "suggesting deep merit-order supply available.")
+        )
+
+    # 2 — Deep merit-order PTUs (large activation, small price move)
+    deep_merit = [
+        ptu for ptu in ptus
+        if abs(ptu["net_mw"] or 0) > 200
+        and ptu["short"] is not None
+        and abs(ptu["short"]) < 30
+    ]
+    if deep_merit:
+        obs.append(
+            f"{len(deep_merit)} PTU(s) with large activation (>200\u00a0MW) "
+            f"but muted price response (<30\u00a0\u20ac/MWh): "
+            + ", ".join(p["time"] for p in deep_merit[:4])
+            + ". Ample reserve capacity available at moderate cost during those intervals."
+        )
+    elif frr_points:
+        obs.append(
+            "No PTUs with large activation (>200\u00a0MW) and muted price (<30\u00a0\u20ac/MWh) "
+            "were found \u2014 all significant activations drove clear price responses."
+        )
+
+    # 3 — Net position vs regulation balance
+    direction = "long" if net_mwh < 0 else "short"
+    explain   = ("more downward than upward balancing was required \u2014 "
+                 "the grid ran long overall (excess generation)."
+                 if net_mwh < 0 else
+                 "more upward than downward balancing was required \u2014 "
+                 "a structurally short grid day.")
+    obs.append(
+        f"Net daily position: upward {total_up_mwh:.0f}\u00a0MWh, "
+        f"downward {total_down_mwh:.0f}\u00a0MWh "
+        f"(net {net_mwh:+.0f}\u00a0MWh). "
+        + explain.capitalize()
+    )
+
+    return {
+        "date":        str(yesterday),
+        "labels":      labels,
+        "shortage":    shortage_s,
+        "surplus":     surplus_s,
+        "da":          da_s,
+        "up_mw":       up_mw_s,
+        "down_mw":     down_mw_s,
+        "ptus":        ptus,
+        "kpis": {
+            "total_up_mwh":   total_up_mwh,
+            "total_down_mwh": total_down_mwh,
+            "net_mwh":        net_mwh,
+            "peak_ptu":       peak_ptu,
+        },
+        "observations": obs,
+        "frr_error":    frr_error,
     }
 
 
@@ -1992,6 +2179,308 @@ function renderWSDObs(data) {
 </script>"""
 
 
+# ── Regulation Detail HTML / JS ───────────────────────────────────────────────
+
+def _regdetail_html():
+    return (
+        '<div id="reg-detail" class="tab-panel">'
+        '<div class="crisis-context">'
+        '<p>TenneT aFRR/mFRR activation volumes aligned with settlement prices and '
+        'ENTSO&#8209;E day-ahead prices per 15&#8209;min PTU. '
+        'Activation volumes converted from kWh\u00a0/\u00a0PTU \u00f7 250 to MW. '
+        'Sources: TenneT FRR Activations API &amp; TenneT Settlement Prices API.</p>'
+        '</div>'
+        '<div id="rd-loading" style="text-align:center;padding:80px 24px;color:#888">'
+        '<div class="spinner"></div>'
+        '<p style="margin-top:12px;font-size:13px">'
+        'Fetching FRR activations &amp; settlement prices\u2026</p>'
+        '</div>'
+        '<div id="rd-content" class="container" style="display:none">'
+        '<div id="rd-cards" class="cards"></div>'
+        '<div class="section-title">'
+        'FRR Activations &amp; Settlement Prices \u2014 Yesterday</div>'
+        '<div class="chart-wrap" style="height:380px">'
+        '<canvas id="chartRegDetail"></canvas>'
+        '</div>'
+        '<div class="section-title">PTU Detail Table</div>'
+        '<div class="table-wrap" style="max-height:420px;overflow-y:auto">'
+        '<table id="rdTable">'
+        '<thead><tr>'
+        '<th>Time</th>'
+        '<th>Reg&nbsp;State</th>'
+        '<th style="text-align:right">Shortage&nbsp;\u20ac/MWh</th>'
+        '<th style="text-align:right">Surplus&nbsp;\u20ac/MWh</th>'
+        '<th style="text-align:right">aFRR&nbsp;Up&nbsp;MW</th>'
+        '<th style="text-align:right">aFRR&nbsp;Down&nbsp;MW</th>'
+        '<th style="text-align:right">Net&nbsp;MW</th>'
+        '<th style="text-align:right">DA&nbsp;Price&nbsp;\u20ac/MWh</th>'
+        '</tr></thead>'
+        '<tbody id="rdTableBody"></tbody>'
+        '</table>'
+        '</div>'
+        '<div id="rd-observations" style="margin-top:24px"></div>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _regdetail_js():
+    return """<script>
+let rdRequested = false;
+
+function loadRegDetailData() {
+  if (rdRequested) return;
+  rdRequested = true;
+  fetch('/api/regdetail')
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      document.getElementById('rd-loading').style.display = 'none';
+      document.getElementById('rd-content').style.display = 'block';
+      renderRDKPIs(data);
+      renderRDChart(data);
+      renderRDTable(data);
+      renderRDObservations(data);
+    })
+    .catch(err => {
+      document.getElementById('rd-loading').innerHTML =
+        '<p style="color:#dc3545;margin-top:40px;font-size:13px">Failed to load: ' + err + '</p>';
+    });
+}
+
+function renderRDKPIs(data) {
+  const k         = data.kpis;
+  const netColor  = k.net_mwh >= 0 ? '#198754' : '#dc3545';
+  const netLabel  = k.net_mwh >= 0 ? 'Net Long Day' : 'Net Short Day';
+  const peakText  = k.peak_ptu
+    ? k.peak_ptu.time + '\u00a0CET \u00b7 ' + k.peak_ptu.dir + ' \u00b7 ' + k.peak_ptu.mw.toFixed(0) + '\u00a0MW'
+    : '\u2014';
+  const cards = [
+    { label: 'UPWARD ACTIVATION',   value: k.total_up_mwh.toFixed(0)  + '\u00a0MWh',
+      sub: 'aFRR + mFRR',           color: '#198754' },
+    { label: 'DOWNWARD ACTIVATION', value: k.total_down_mwh.toFixed(0) + '\u00a0MWh',
+      sub: 'aFRR + mFRR',           color: '#dc3545' },
+    { label: 'PEAK ACTIVATION PTU', value: peakText,
+      sub: 'highest absolute volume', color: '#222' },
+    { label: 'NET DAILY POSITION',
+      value: (k.net_mwh >= 0 ? '+' : '') + k.net_mwh.toFixed(0) + '\u00a0MWh',
+      sub: netLabel, color: netColor },
+  ];
+  document.getElementById('rd-cards').innerHTML = cards.map(c =>
+    '<div class="card">' +
+    '<div class="label">' + c.label + '</div>' +
+    '<div class="value" style="color:' + c.color + '">' + c.value + '</div>' +
+    '<div class="sub">' + c.sub + '</div></div>'
+  ).join('');
+}
+
+function renderRDChart(data) {
+  const ch = Chart.getChart('chartRegDetail');
+  if (ch) ch.destroy();
+
+  // Inline plugin: dashed zero-line on both axes
+  const zeroLinePlugin = {
+    id: 'rdZeroLines',
+    afterDatasetsDraw(chart) {
+      const { ctx, scales, chartArea } = chart;
+      ['yLeft', 'yRight'].forEach(id => {
+        const ax = scales[id];
+        if (!ax) return;
+        const y0 = ax.getPixelForValue(0);
+        if (y0 < chartArea.top || y0 > chartArea.bottom) return;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0,0,0,0.22)';
+        ctx.lineWidth   = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(chartArea.left,  y0);
+        ctx.lineTo(chartArea.right, y0);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+      });
+    }
+  };
+
+  new Chart(document.getElementById('chartRegDetail'), {
+    type: 'bar',
+    plugins: [zeroLinePlugin],
+    data: {
+      labels: data.labels,
+      datasets: [
+        {
+          type: 'bar',
+          label: 'aFRR Up (MW)',
+          data: data.up_mw,
+          backgroundColor: 'rgba(46,204,113,0.65)',
+          borderColor:     'rgba(46,204,113,0.85)',
+          borderWidth: 0,
+          yAxisID: 'yRight',
+          order: 2,
+        },
+        {
+          type: 'bar',
+          label: 'aFRR Down (MW)',
+          data: data.down_mw,
+          backgroundColor: 'rgba(231,76,60,0.65)',
+          borderColor:     'rgba(231,76,60,0.85)',
+          borderWidth: 0,
+          yAxisID: 'yRight',
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: 'Shortage',
+          data: data.shortage,
+          borderColor: '#dc3545',
+          backgroundColor: 'transparent',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.2,
+          spanGaps: true,
+          yAxisID: 'yLeft',
+          order: 1,
+        },
+        {
+          type: 'line',
+          label: 'Surplus',
+          data: data.surplus,
+          borderColor: '#198754',
+          backgroundColor: 'transparent',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.2,
+          spanGaps: true,
+          yAxisID: 'yLeft',
+          order: 1,
+        },
+        {
+          type: 'line',
+          label: 'DA Price',
+          data: data.da,
+          borderColor: '#0d6efd',
+          backgroundColor: 'transparent',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.2,
+          spanGaps: true,
+          yAxisID: 'yLeft',
+          order: 1,
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            label: c => {
+              const v = c.parsed.y;
+              if (v == null) return null;
+              const unit = c.dataset.yAxisID === 'yLeft' ? ' \u20ac/MWh' : ' MW';
+              return ' ' + c.dataset.label + ': ' + v.toFixed(1) + unit;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            autoSkip: false,
+            maxRotation: 0,
+            font: { size: 10 },
+            callback: (val, idx) => idx % 4 === 0 ? data.labels[idx] : '',
+          },
+          grid: { color: 'rgba(0,0,0,0.04)' }
+        },
+        yLeft: {
+          type: 'linear',
+          position: 'left',
+          title: { display: true, text: '\u20ac/MWh', font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid: {
+            color: ctx => ctx.tick.value === 0
+              ? 'rgba(0,0,0,0.22)'
+              : 'rgba(0,0,0,0.05)'
+          }
+        },
+        yRight: {
+          type: 'linear',
+          position: 'right',
+          title: { display: true, text: 'MW', font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid: { drawOnChartArea: false }
+        }
+      }
+    }
+  });
+}
+
+function renderRDTable(data) {
+  const REG_LABELS = {'1':'UP', '-1':'DOWN', '0':'STABLE', '2':'UP+DOWN'};
+  const REG_BG     = {'1':'#fffbe6', '-1':'#e6f4ff', '0':'', '2':'#f3e6ff'};
+  const fmt   = v => v != null ? v.toFixed(2) : '\u2014';
+  const fmtMW = v => v != null ? v.toFixed(1) : '\u2014';
+
+  const rows = data.ptus.map(p => {
+    const bg     = REG_BG[String(p.reg)] || '';
+    const netAbs = Math.abs(p.net_mw || 0);
+    let leftBorder = '';
+    if (netAbs > 200) {
+      leftBorder = (p.net_mw || 0) > 0
+        ? 'border-left:3px solid #2ECC71;'
+        : 'border-left:3px solid #E74C3C;';
+    }
+    return '<tr style="background:' + bg + ';' + leftBorder + '">' +
+      '<td>'          + p.time + '</td>' +
+      '<td>'          + (REG_LABELS[String(p.reg)] || p.reg) + '</td>' +
+      '<td class="num">' + fmt(p.short)  + '</td>' +
+      '<td class="num">' + fmt(p.surp)   + '</td>' +
+      '<td class="num">' + fmtMW(p.up_mw)  + '</td>' +
+      '<td class="num">' + fmtMW(p.dn_mw)  + '</td>' +
+      '<td class="num">' + fmtMW(p.net_mw) + '</td>' +
+      '<td class="num">' + fmt(p.da)     + '</td>' +
+      '</tr>';
+  });
+  document.getElementById('rdTableBody').innerHTML = rows.join('');
+}
+
+function renderRDObservations(data) {
+  let html = '<div class="section-title">Observations</div>';
+
+  if (data.frr_error) {
+    html += '<div style="background:#fff3cd;border-left:3px solid #fd7e14;padding:10px 14px;'
+          + 'margin-bottom:12px;border-radius:4px;font-size:12px;color:#6c3a00">'
+          + '\u26a0 FRR activation data unavailable \u2014 showing prices only. '
+          + 'Error: ' + data.frr_error + '</div>';
+  }
+
+  const obs = data.observations || [];
+  if (obs.length) {
+    html += '<ul style="background:#fff;border-radius:8px;padding:16px 20px;'
+          + 'box-shadow:0 1px 3px rgba(0,0,0,.1);list-style:none;margin-bottom:16px">';
+    obs.forEach((o, i) => {
+      html += '<li style="padding:6px 0 6px 16px;border-left:3px solid #4f8ef7;'
+            + 'margin-bottom:8px;font-size:13px;line-height:1.6">'
+            + '<span style="font-weight:600;color:#4f8ef7">' + (i + 1) + '.</span> '
+            + o + '</li>';
+    });
+    html += '</ul>';
+  }
+
+  html += '<p style="font-size:11px;color:#999;margin-top:4px">'
+        + 'Activation volumes in MW (converted from kWh per PTU \u00f7 250). '
+        + 'Source: TenneT FRR Activations API. '
+        + 'Settlement prices: TenneT Settlement Prices API.</p>';
+
+  document.getElementById('rd-observations').innerHTML = html;
+}
+</script>"""
+
+
 # ── HTML rendering ────────────────────────────────────────────────────────────
 
 def render_html(yesterday, points, da_prices):
@@ -2164,6 +2653,7 @@ def render_html(yesterday, points, da_prices):
     <button onclick="showTab('renewables-nl', this)">Renewables NL</button>
     <button onclick="showTab('price-heatmap', this)">Price Heatmap</button>
     <button onclick="showTab('wsd', this)">Weather &amp; Supply</button>
+    <button onclick="showTab('reg-detail', this)">Regulation Detail</button>
   </nav>
 
   <div id="daily-imbalance" class="tab-panel active">
@@ -2234,6 +2724,7 @@ def render_html(yesterday, points, da_prices):
   RENEWABLES_PLACEHOLDER
   HEATMAP_PLACEHOLDER
   WSD_PLACEHOLDER
+  REGDETAIL_PLACEHOLDER
 
   <script>
     function showTab(id, btn) {{
@@ -2246,6 +2737,7 @@ def render_html(yesterday, points, da_prices):
       if (id === 'renewables-nl') loadRenewablesData();
       if (id === 'price-heatmap') loadHeatmapData();
       if (id === 'wsd')           loadWSDData();
+      if (id === 'reg-detail')    loadRegDetailData();
     }}
   </script>
 
@@ -2323,19 +2815,22 @@ def render_html(yesterday, points, da_prices):
   RENEWABLES_JS_PLACEHOLDER
   HEATMAP_JS_PLACEHOLDER
   WSD_JS_PLACEHOLDER
+  REGDETAIL_JS_PLACEHOLDER
 </body>
 </html>"""
-    html = html.replace("CRISIS_VIEW_PLACEHOLDER",   _crisis_html())
+    html = html.replace("CRISIS_VIEW_PLACEHOLDER",    _crisis_html())
     html = html.replace("GAS_STORAGE_PLACEHOLDER",   _gas_storage_html())
     html = html.replace("RENEWABLES_PLACEHOLDER",    _renewables_html())
     html = html.replace("HEATMAP_PLACEHOLDER",       _heatmap_html())
     html = html.replace("WSD_PLACEHOLDER",           _wsd_html())
+    html = html.replace("REGDETAIL_PLACEHOLDER",     _regdetail_html())
     html = html.replace("SHARED_JS_PLACEHOLDER",     _shared_js())
     html = html.replace("CRISIS_JS_PLACEHOLDER",     _crisis_js())
     html = html.replace("GAS_STORAGE_JS_PLACEHOLDER", _gas_storage_js())
     html = html.replace("RENEWABLES_JS_PLACEHOLDER", _renewables_js())
     html = html.replace("HEATMAP_JS_PLACEHOLDER",    _heatmap_js())
     html = html.replace("WSD_JS_PLACEHOLDER",        _wsd_js())
+    html = html.replace("REGDETAIL_JS_PLACEHOLDER",  _regdetail_js())
     return html
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -2347,6 +2842,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/renewables":  self._serve_json_api(build_renewables_data,  _renewables_cache)
         elif self.path == "/api/heatmap":     self._serve_json_api(build_heatmap_data,     _heatmap_cache)
         elif self.path == "/api/wsd":         self._serve_json_api(build_wsd_data,         _wsd_cache)
+        elif self.path == "/api/regdetail":   self._serve_json_api(build_regdetail_data,   _regdetail_cache)
         else:                                 self._serve_dashboard()
 
     def _serve_dashboard(self):
