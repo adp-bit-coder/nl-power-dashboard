@@ -2905,15 +2905,21 @@ def port_in_use(host, port):
         return s.connect_ex((host, port)) == 0
 
 if __name__ == "__main__":
-    host = "127.0.0.1"
+    # HOST=0.0.0.0 lets a cloud preview pane reach the server; default stays local-only.
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", 5050))
-    url  = f"http://{host}:{port}"
+    url  = f"http://127.0.0.1:{port}"
+    # Skip the browser when NO_BROWSER is set or on a headless Linux box.
+    open_browser = not os.environ.get("NO_BROWSER") and not (
+        sys.platform.startswith("linux") and not os.environ.get("DISPLAY"))
 
-    if port_in_use(host, port):
-        print(f"Dashboard already running — opening {url}", flush=True)
-        webbrowser.open(url)
+    if port_in_use("127.0.0.1", port):
+        print(f"Dashboard already running at {url}", flush=True)
+        if open_browser:
+            webbrowser.open(url)
     else:
-        print(f"Starting Power Dashboard at {url}", flush=True)
-        threading.Timer(1.5, webbrowser.open, args=[url]).start()
+        print(f"Starting Power Dashboard on {host}:{port} ({url})", flush=True)
+        if open_browser:
+            threading.Timer(1.5, webbrowser.open, args=[url]).start()
         server = HTTPServer((host, port), Handler)
         server.serve_forever()
